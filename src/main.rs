@@ -3,7 +3,7 @@ use dslite_b4::tunnel::illumos::IllumosBackend;
 #[cfg(target_os = "linux")]
 use dslite_b4::tunnel::linux::LinuxBackend;
 use dslite_b4::{config::Config, dns::resolve, tunnel::TunnelBackend};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tokio::signal;
 
 use clap::{Parser, Subcommand};
@@ -44,17 +44,48 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run { config } => {
             let config = toml::from_str::<Config>(&std::fs::read_to_string(config)?)?;
             let aftr_ip = resolve(&config.aftr.address).await?;
+            let local_v6 = match config.tunnel.local_v6 {
+                Some(addr) => addr,
+                None => {
+                    let mut attempt: u64 = 0;
+                    loop {
+                        match dslite_b4::discovery::discover_local_v6(aftr_ip).await {
+                            Ok(addr) => {
+                                if attempt > 0 {
+                                    tracing::info!(%addr, attempt, "local_v6 discovered after {attempt} attempts");
+                                } else {
+                                    tracing::info!(%addr, "local_v6 discovered");
+                                }
+                                break addr;
+                            }
+                            Err(e) if e.is_transient() => {
+                                attempt += 1;
+                                let secs = (1u64 << attempt.min(5)).min(30);
+                                if attempt == 1 {
+                                    tracing::warn!("{}, retrying...", e);
+                                } else {
+                                    tracing::debug!("{e}, retry #{attempt} in {secs}s")
+                                }
+
+                                tokio::time::sleep(Duration::from_secs(secs)).await;
+                                continue;
+                            }
+                            Err(e) => return Err(anyhow::anyhow!(e)),
+                        }
+                    }
+                }
+            };
             #[cfg(target_os = "linux")]
             let backend = LinuxBackend::new(
                 config.tunnel.name,
-                config.tunnel.local_v6,
+                local_v6,
                 aftr_ip,
                 config.tunnel.local_v4,
             );
             #[cfg(target_os = "illumos")]
             let backend = IllumosBackend::new(
                 config.tunnel.name,
-                config.tunnel.local_v6,
+                local_v6,
                 aftr_ip,
                 config.tunnel.local_v4,
             )?;

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dhcpv6;
+pub mod discovery;
 pub mod dns;
 pub mod lifecycle;
 pub mod tunnel;

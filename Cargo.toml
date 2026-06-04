@@ -20,13 +20,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1.0.102"
+libc = "0.2.186"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.20.0"
 futures-util = "0.3.32"
-
-[target.'cfg(target_os = "illumos")'.dependencies]
-libc = "0.2.186"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

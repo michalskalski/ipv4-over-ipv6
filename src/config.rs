@@ -13,7 +13,7 @@ pub struct Config {
 pub struct TunnelConfig {
     #[serde(default = "default_tunnel_name")]
     pub name: String,
-    pub local_v6: Ipv6Addr,
+    pub local_v6: Option<Ipv6Addr>,
     #[serde(
         default = "default_tunnel_local_v4",
         deserialize_with = "deserialize_b4_v4"
