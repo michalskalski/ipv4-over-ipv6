@@ -547,3 +547,95 @@ fn parse_tunnel_addr(
         TunnelError::StatusCheckFailed(format!("invalid {endpoint} IPv6 address {text:?}: {e}"))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c_addr(value: &str) -> [c_char; NI_MAXHOST] {
+        let mut result = [0; NI_MAXHOST];
+
+        for (destination, source) in result.iter_mut().zip(value.bytes()) {
+            *destination = source as c_char;
+        }
+
+        result
+    }
+
+    #[test]
+    fn parses_ipv6_tunnel_address() {
+        let value = c_addr("2001:db8::1");
+
+        let address = parse_tunnel_addr(&value, "local").unwrap();
+
+        assert_eq!(address, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_ipv6_tunnel_address() {
+        let value = c_addr("not-an-address");
+
+        let error = parse_tunnel_addr(&value, "remote").unwrap_err();
+
+        assert!(error.to_string().contains("invalid remote IPv6 address"));
+    }
+
+    #[test]
+    fn rejects_non_terminated_tunnel_address() {
+        let value = [b'a' as c_char; NI_MAXHOST];
+
+        let error = parse_tunnel_addr(&value, "local").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("local tunnel address is not NUL-terminated")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires tunnel state prepared by scripts/test-illumos-observe.sh"]
+    async fn observes_illumos_tunnel() {
+        let name = std::env::var("DSLITE_TEST_TUNNEL")
+            .expect("DSLITE_TEST_TUNNEL must name the prepared test tunnel");
+        let expected = std::env::var("DSLITE_TEST_EXPECT")
+            .expect("DSLITE_TEST_EXPECT must be present-up, present-down, or absent");
+        let backend = IllumosBackend::new(
+            name,
+            Ipv6Addr::UNSPECIFIED,
+            Ipv6Addr::UNSPECIFIED,
+            Ipv4Addr::new(192, 0, 0, 2),
+        )
+        .unwrap();
+
+        let observed = backend.observe().await.unwrap();
+
+        if expected == "absent" {
+            assert_eq!(observed, Observed::Absent);
+            return;
+        }
+
+        let local_v6 = std::env::var("DSLITE_TEST_LOCAL_V6")
+            .expect("DSLITE_TEST_LOCAL_V6 must contain the prepared local endpoint")
+            .parse()
+            .expect("DSLITE_TEST_LOCAL_V6 must be an IPv6 address");
+        let remote_v6 = std::env::var("DSLITE_TEST_REMOTE_V6")
+            .expect("DSLITE_TEST_REMOTE_V6 must contain the prepared remote endpoint")
+            .parse()
+            .expect("DSLITE_TEST_REMOTE_V6 must be an IPv6 address");
+        let admin_up = match expected.as_str() {
+            "present-up" => true,
+            "present-down" => false,
+            value => panic!("unexpected DSLITE_TEST_EXPECT value: {value}"),
+        };
+
+        assert_eq!(
+            observed,
+            Observed::Present {
+                local_v6,
+                remote_v6,
+                admin_up,
+            }
+        );
+    }
+}
