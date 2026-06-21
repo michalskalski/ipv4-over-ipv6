@@ -14,6 +14,10 @@ use std::{
 /// <https://github.com/illumos/illumos-gate/blob/0764e87f4a667f36d63262fcdd690064929acc48/usr/src/lib/libdladm/common/libdladm.h#L104>
 pub const DLADM_STATUS_OK: u32 = 0;
 
+/// `dladm_status_t::DLADM_STATUS_NOTFOUND`.
+/// <https://github.com/illumos/illumos-gate/blob/0764e87f4a667f36d63262fcdd690064929acc48/usr/src/lib/libdladm/common/libdladm.h#L109>
+pub const DLADM_STATUS_NOTFOUND: u32 = 5;
+
 /// `DLADM_OPT_ACTIVE`, apply changes to the active configuration only
 /// (not the persistent SMF-managed state).
 /// <https://github.com/illumos/illumos-gate/blob/0764e87f4a667f36d63262fcdd690064929acc48/usr/src/lib/libdladm/common/libdladm.h#L86>
@@ -56,6 +60,11 @@ unsafe extern "C" {
         flags: c_uint,
     ) -> u32;
     pub fn dladm_iptun_delete(handle: *mut c_void, link_id: u32, flags: c_uint) -> u32;
+    pub fn dladm_iptun_getparams(
+        handle: *mut c_void,
+        params: *mut IpTunParams,
+        flags: c_uint,
+    ) -> u32;
     pub fn dladm_name2info(
         handle: *mut c_void,
         name: *const c_char,
@@ -186,15 +195,17 @@ pub struct IpsecReq {
     pub ipsr_esp_auth_alg: u8,
 }
 
-/// `iptun_type_t`. `Ipv6` (IPv4-in-IPv6) for DS-Lite.
+/// `iptun_type_t`.
+///
+/// This FFI type is represented as an integer rather than a Rust enum
+/// because C may write any value into it. In particular, an all-zero
+/// `IpTunParams` output buffer must be valid before
+/// `dladm_iptun_getparams` populates it.
 /// <https://github.com/illumos/illumos-gate/blob/0764e87f4a667f36d63262fcdd690064929acc48/usr/src/uts/common/inet/iptun.h#L58>
-#[repr(u32)]
-pub enum IpTunType {
-    // Unknown = 0,
-    // Ipv4 = 1,
-    Ipv6 = 2,
-    // SixToFour = 3,
-}
+pub type IpTunType = u32;
+
+/// `IPTUN_TYPE_IPV6`, IPv4-in-IPv6 for DS-Lite.
+pub const IPTUN_TYPE_IPV6: IpTunType = 2;
 
 /// `iptun_params_t`. Address fields are NUL-terminated printable strings up to NI_MAXHOST bytes.
 /// Libdladm calls getaddrinfo internally to parse them.
@@ -452,6 +463,35 @@ pub unsafe fn bring_up(sock_fd: c_int, name: &CStr) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Return whether `name` has `IFF_UP` set.
+///
+/// # Safety
+///
+/// - `sock_fd` must be a valid, open file descriptor for a socket that
+///   accepts SIOCSLIF* ioctls (AF_INET / SOCK_DGRAM is the standard
+///   choice on illumos).
+pub unsafe fn is_up(sock_fd: c_int, name: &CStr) -> io::Result<bool> {
+    let mut lr = lifreq_for_name(name)?;
+
+    // SAFETY:
+    // - `sock_fd` is a valid socket fd suitable for SIOCSLIF* ioctls
+    //   (caller's contract).
+    // - `SIOCGLIFFLAGS` reads interface flags from the kernel into the
+    //   `flags` slot of `lifr_lifru`, expecting a `Lifreq` argument.
+    // - `&raw mut lr` points to a fully-initialized 376-byte `Lifreq`
+    //   produced by `lifreq_for_name`. `lr` lives until function return.
+    let rc = unsafe { libc::ioctl(sock_fd, SIOCGLIFFLAGS as _, &raw mut lr) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: SIOCGLIFFLAGS just populated `lr.lifr_lifru.flags` with a
+    // `u64` from the kernel, so reading that union slot as `u64` is sound.
+    let flags = unsafe { lr.lifr_lifru.flags };
+
+    Ok((flags & IFF_UP) != 0)
 }
 
 // PF_ROUTE <net/route.h>

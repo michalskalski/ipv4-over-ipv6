@@ -16,6 +16,7 @@ mod sys;
 use crate::tunnel::illumos::pf_route::RouteSocket;
 use crate::tunnel::{AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, Observed, TunnelBackend, TunnelError};
 use std::io;
+use std::mem::MaybeUninit;
 use std::{
     ffi::{CString, c_char, c_void},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -136,6 +137,51 @@ impl IllumosBackend {
         Ok(())
     }
 
+    fn get_tunnel_params(&self, handle: &DladmHandle) -> Result<Option<IpTunParams>, TunnelError> {
+        let (link_id, status) = self.name_to_linkid(handle);
+        if status == DLADM_STATUS_NOTFOUND {
+            return Ok(None);
+        }
+        if status != DLADM_STATUS_OK {
+            return Err(TunnelError::StatusCheckFailed(format!(
+                "failed to get linkid, dladm_name2info status: {}",
+                status
+            )));
+        }
+
+        // SAFETY: Every field of `IpTunParams` accepts an all-zero bit pattern.
+        // Integer fields and byte arrays permit zero, and `IpTunType` is a `u32`
+        // alias rather than a restricted Rust enum.
+        let mut params: IpTunParams = unsafe { MaybeUninit::zeroed().assume_init() };
+        params.link_id = link_id;
+
+        // SAFETY:
+        // - `handle.ptr` was produced by a successful `dladm_open` (see
+        //   `open_dladm`) and remains live for the `&DladmHandle` borrow.
+        // - `&mut params` is a stack-local `IpTunParams` owned exclusively
+        //   here, valid for writes.
+        let status = unsafe { dladm_iptun_getparams(handle.ptr, &mut params, DLADM_OPT_ACTIVE) };
+        if status != DLADM_STATUS_OK {
+            return Err(TunnelError::StatusCheckFailed(format!(
+                "dladm_iptun_getparams failed with status: {}",
+                status
+            )));
+        };
+        Ok(Some(params))
+    }
+
+    fn is_admin_up(&self) -> Result<bool, TunnelError> {
+        let socket = open_inet_dgram_socket().map_err(|e| {
+            TunnelError::StatusCheckFailed(format!("opening interface flags socket: {e}"))
+        })?;
+        let fd = socket.as_raw_fd();
+
+        // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
+        // which accepts SIOCSLIF* ioctls.
+        unsafe { is_up(fd, &self.cname) }
+            .map_err(|e| TunnelError::StatusCheckFailed(format!("reading interface flags: {e}")))
+    }
+
     fn delete_tunnel(&self, handle: &DladmHandle) -> Result<(), TunnelError> {
         let (link_id, status) = self.name_to_linkid(handle);
         if status != DLADM_STATUS_OK {
@@ -221,7 +267,9 @@ impl TunnelBackend for IllumosBackend {
         })?;
         self.create_if(&ip_handle)?;
 
-        let sock_fd = open_inet_dgram_socket()?;
+        let sock_fd = open_inet_dgram_socket().map_err(|e| {
+            TunnelError::CreationFailed(format!("opening address configuration socket: {e}"))
+        })?;
         let fd = sock_fd.as_raw_fd();
 
         // The four calls below each require an fd that accepts SIOCSLIF*
@@ -264,7 +312,9 @@ impl TunnelBackend for IllumosBackend {
         })?;
 
         // clear the address
-        let sock_fd = open_inet_dgram_socket()?;
+        let sock_fd = open_inet_dgram_socket().map_err(|e| {
+            TunnelError::DestroyFailed(format!("opening address configuration socket: {e}"))
+        })?;
         let fd = sock_fd.as_raw_fd();
 
         // SAFETY: `fd` is a fresh AF_INET/SOCK_DGRAM socket from
@@ -301,7 +351,44 @@ impl TunnelBackend for IllumosBackend {
     }
 
     async fn observe(&self) -> Result<Observed, TunnelError> {
-        Ok(Observed::Absent)
+        let handle = open_dladm().map_err(|e| {
+            TunnelError::StatusCheckFailed(format!(
+                "unable to open handle, dladm_open status {}",
+                e
+            ))
+        })?;
+
+        let Some(params) = self.get_tunnel_params(&handle)? else {
+            return Ok(Observed::Absent);
+        };
+
+        if params.ip_tun_type != IPTUN_TYPE_IPV6 {
+            return Err(TunnelError::StatusCheckFailed(format!(
+                "expected IPv6 tunnel type, got {}",
+                params.ip_tun_type
+            )));
+        }
+
+        if params.flags & IPTUN_PARAM_LADDR == 0 {
+            return Err(TunnelError::StatusCheckFailed(
+                "tunnel local endpoint missing".to_string(),
+            ));
+        }
+
+        if params.flags & IPTUN_PARAM_RADDR == 0 {
+            return Err(TunnelError::StatusCheckFailed(
+                "tunnel remote endpoint missing".to_string(),
+            ));
+        }
+        let local_v6 = parse_tunnel_addr(&params.l_addr, "local")?;
+        let remote_v6 = parse_tunnel_addr(&params.r_addr, "remote")?;
+        let admin_up = self.is_admin_up()?;
+
+        Ok(Observed::Present {
+            local_v6,
+            remote_v6,
+            admin_up,
+        })
     }
 }
 
@@ -384,7 +471,7 @@ fn build_tunnel_params(local: &Ipv6Addr, remote: &Ipv6Addr) -> IpTunParams {
     IpTunParams {
         link_id: 0,
         flags: IPTUN_PARAM_TYPE | IPTUN_PARAM_LADDR | IPTUN_PARAM_RADDR,
-        ip_tun_type: IpTunType::Ipv6,
+        ip_tun_type: IPTUN_TYPE_IPV6,
         l_addr: addr_to_caddr(&IpAddr::V6(*local)),
         r_addr: addr_to_caddr(&IpAddr::V6(*remote)),
         sec_info: IpsecReq {
@@ -424,15 +511,12 @@ fn open_ipadm() -> Result<IpadmHandle, u32> {
     Ok(IpadmHandle { ptr })
 }
 
-fn open_inet_dgram_socket() -> Result<OwnedFd, TunnelError> {
+fn open_inet_dgram_socket() -> io::Result<OwnedFd> {
     // SAFETY: FFI call with no outstanding preconditions.
     let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
 
     if raw == -1 {
-        return Err(TunnelError::CreationFailed(format!(
-            "unable to open socket: {}",
-            io::Error::last_os_error()
-        )));
+        return Err(io::Error::last_os_error());
     }
 
     // SAFETY:
@@ -443,4 +527,23 @@ fn open_inet_dgram_socket() -> Result<OwnedFd, TunnelError> {
     //   by any other code, so this `from_raw_fd` is the sole owner.
     // - The returned `OwnedFd` will close the descriptor on drop.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+fn parse_tunnel_addr(
+    value: &[c_char; NI_MAXHOST],
+    endpoint: &str,
+) -> Result<Ipv6Addr, TunnelError> {
+    let nul = value.iter().position(|&byte| byte == 0).ok_or_else(|| {
+        TunnelError::StatusCheckFailed(format!("{endpoint} tunnel address is not NUL-terminated"))
+    })?;
+
+    let bytes: Vec<u8> = value[..nul].iter().map(|&byte| byte as u8).collect();
+
+    let text = str::from_utf8(&bytes).map_err(|e| {
+        TunnelError::StatusCheckFailed(format!("invalid {endpoint} tunnel address: {e}"))
+    })?;
+
+    text.parse::<Ipv6Addr>().map_err(|e| {
+        TunnelError::StatusCheckFailed(format!("invalid {endpoint} IPv6 address {text:?}: {e}"))
+    })
 }
