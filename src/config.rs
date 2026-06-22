@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
 
 use serde::{Deserialize, Deserializer};
 
@@ -65,15 +66,15 @@ pub struct AftrConfig {
 #[derive(Deserialize, Debug)]
 pub struct HealthConfig {
     #[serde(default = "default_health_interval")]
-    pub interval_secs: u64,
+    pub interval_secs: NonZeroU64,
 }
 
 fn default_tunnel_name() -> String {
     "dslite0".into()
 }
 
-fn default_health_interval() -> u64 {
-    30
+fn default_health_interval() -> NonZeroU64 {
+    NonZeroU64::new(30).unwrap()
 }
 
 fn default_tunnel_local_v4() -> Ipv4Addr {
