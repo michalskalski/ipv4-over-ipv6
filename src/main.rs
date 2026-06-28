@@ -34,6 +34,32 @@ enum Commands {
 }
 
 const PROVIDED_AFTR_FILENAME: &str = "aftr";
+const PID_FILENAME: &str = "dslite-b4.pid";
+
+struct PidFile {
+    path: PathBuf,
+}
+
+impl PidFile {
+    fn create(path: PathBuf) -> anyhow::Result<Self> {
+        std::fs::write(&path, std::process::id().to_string())
+            .with_context(|| format!("writing pidfile {}", path.display()))?;
+
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let Ok(pid) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+
+        if pid.trim() == std::process::id().to_string() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,6 +85,8 @@ async fn main() -> anyhow::Result<()> {
                 )
             })?;
 
+            let _pid = PidFile::create(config.runtime.state_dir.join(PID_FILENAME))?;
+
             #[cfg(target_os = "linux")]
             let backend = LinuxBackend::new(config.tunnel.name.clone());
             #[cfg(target_os = "illumos")]
@@ -72,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let mut sigusr1 = signal::unix::signal(signal::unix::SignalKind::user_defined1())?;
     let mut network_changes = NetworkChanges::new()?;
     let mut attempt: u64 = 0;
     loop {
@@ -94,6 +123,10 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
         tokio::select! {
             _ = tokio::time::sleep(delay) => {},
             result = network_changes.changed() => { result?; attempt = 0; }
+            _ = sigusr1.recv() => {
+                tracing::debug!("runtime state refresh requested");
+                attempt = 0;
+            },
             _ = signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
         }
