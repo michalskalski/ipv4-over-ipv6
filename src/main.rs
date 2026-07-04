@@ -11,7 +11,13 @@ use dslite_b4::{
     network_changes::NetworkChanges,
     tunnel::{DesiredState, TunnelBackend},
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    fs::{File, OpenOptions, TryLockError},
+    io::Write,
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+    time::Duration,
+};
 use tokio::signal;
 
 #[derive(Parser)]
@@ -38,24 +44,54 @@ const PID_FILENAME: &str = "dslite-b4.pid";
 
 struct PidFile {
     path: PathBuf,
+    _lock: File,
+    dev: u64,
+    ino: u64,
 }
 
 impl PidFile {
     fn create(path: PathBuf) -> anyhow::Result<Self> {
-        std::fs::write(&path, std::process::id().to_string())
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("opening pidfile {}", path.display()))?;
+
+        match file.try_lock() {
+            Ok(_) => (),
+            Err(TryLockError::WouldBlock) => {
+                anyhow::bail!("another dslite-b4 daemon is already running");
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("locking pidfile {}", path.display()));
+            }
+        }
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading pidfile metadata {}", path.display()))?;
+        file.set_len(0)
+            .with_context(|| format!("truncating pidfile {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking pidfile {}", path.display()))?;
+        write!(file, "{}\n", std::process::id())
             .with_context(|| format!("writing pidfile {}", path.display()))?;
 
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            _lock: file,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
     }
 }
 
 impl Drop for PidFile {
     fn drop(&mut self) {
-        let Ok(pid) = std::fs::read_to_string(&self.path) else {
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
             return;
         };
-
-        if pid.trim() == std::process::id().to_string() {
+        if metadata.dev() == self.dev && metadata.ino() == self.ino {
             let _ = std::fs::remove_file(&self.path);
         }
     }
