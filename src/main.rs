@@ -9,13 +9,13 @@ use dslite_b4::{
     dns::resolve,
     lifecycle::{Desired, reconcile_once},
     network_changes::NetworkChanges,
+    runtime_state::{
+        self, PidFile, clear_provided_aftr, signal_daemon_refresh, write_provided_aftr,
+    },
     tunnel::{DesiredState, TunnelBackend},
 };
 use std::{
-    fs::{File, OpenOptions, TryLockError},
-    io::Write,
-    os::unix::fs::MetadataExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::signal;
@@ -23,78 +23,19 @@ use tokio::signal;
 #[derive(Parser)]
 #[command(name = "dslite-b4", about = "DS-Lite B4 client")]
 struct Cli {
+    #[arg(short, long, default_value = "/etc/dslite-b4.toml", global = true)]
+    config: PathBuf,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    Run {
-        #[arg(short, long)]
-        config: PathBuf,
-    },
-    CheckConfig {
-        #[arg(short, long)]
-        config: PathBuf,
-    },
-}
-
-const PROVIDED_AFTR_FILENAME: &str = "aftr";
-const PID_FILENAME: &str = "dslite-b4.pid";
-
-struct PidFile {
-    path: PathBuf,
-    _lock: File,
-    dev: u64,
-    ino: u64,
-}
-
-impl PidFile {
-    fn create(path: PathBuf) -> anyhow::Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .with_context(|| format!("opening pidfile {}", path.display()))?;
-
-        match file.try_lock() {
-            Ok(_) => (),
-            Err(TryLockError::WouldBlock) => {
-                anyhow::bail!("another dslite-b4 daemon is already running");
-            }
-            Err(TryLockError::Error(err)) => {
-                return Err(err).with_context(|| format!("locking pidfile {}", path.display()));
-            }
-        }
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("reading pidfile metadata {}", path.display()))?;
-        file.set_len(0)
-            .with_context(|| format!("truncating pidfile {}", path.display()))?;
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("seeking pidfile {}", path.display()))?;
-        write!(file, "{}\n", std::process::id())
-            .with_context(|| format!("writing pidfile {}", path.display()))?;
-
-        Ok(Self {
-            path,
-            _lock: file,
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        })
-    }
-}
-
-impl Drop for PidFile {
-    fn drop(&mut self) {
-        let Ok(metadata) = std::fs::metadata(&self.path) else {
-            return;
-        };
-        if metadata.dev() == self.dev && metadata.ino() == self.ino {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+    Run,
+    CheckConfig,
+    SetAftr { addr: String },
+    ClearAftr,
 }
 
 #[tokio::main]
@@ -106,22 +47,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    match cli.command {
-        Commands::CheckConfig { config } => {
-            let config = toml::from_str::<Config>(&std::fs::read_to_string(config)?)?;
+    let config = load_config(&cli.config)?;
+    match cli.command.unwrap_or(Commands::Run) {
+        Commands::CheckConfig => {
             tracing::info!(?config);
         }
-        Commands::Run { config } => {
-            let config = toml::from_str::<Config>(&std::fs::read_to_string(config)?)?;
-
-            std::fs::create_dir_all(&config.runtime.state_dir).with_context(|| {
-                format!(
-                    "creating runtime state directory {}",
-                    config.runtime.state_dir.display()
-                )
-            })?;
-
-            let _pid = PidFile::create(config.runtime.state_dir.join(PID_FILENAME))?;
+        Commands::Run => {
+            let _pid = PidFile::create(&config.runtime.state_dir)?;
 
             #[cfg(target_os = "linux")]
             let backend = LinuxBackend::new(config.tunnel.name.clone());
@@ -129,6 +61,14 @@ async fn main() -> anyhow::Result<()> {
             let backend = IllumosBackend::new(config.tunnel.name.clone())?;
 
             run(backend, &config).await?
+        }
+        Commands::SetAftr { addr } => {
+            write_provided_aftr(&config.runtime.state_dir, &addr)?;
+            signal_daemon_refresh(&config.runtime.state_dir)?;
+        }
+        Commands::ClearAftr => {
+            clear_provided_aftr(&config.runtime.state_dir)?;
+            signal_daemon_refresh(&config.runtime.state_dir)?;
         }
     }
     Ok(())
@@ -206,18 +146,11 @@ fn effective_aftr(config: &Config) -> anyhow::Result<Option<AftrAddress>> {
     if let Some(address) = &config.aftr.address {
         return Ok(Some(address.clone()));
     }
+    runtime_state::read_provided_aftr(&config.runtime.state_dir)
+}
 
-    let path = config.runtime.state_dir.join(PROVIDED_AFTR_FILENAME);
-
-    match std::fs::read_to_string(&path) {
-        Ok(value) => {
-            let value = value.trim();
-            if value.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(AftrAddress::from(value.to_owned())))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading AFTR state file {}", path.display())),
-    }
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
 }
