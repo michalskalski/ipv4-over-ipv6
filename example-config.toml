@@ -12,3 +12,8 @@ local_v4 = "192.0.0.2"
 address = "2001:db8::2"
 
 [health]
+# Periodic reconciliation interval. Network-change and runtime-state hints wake sooner.
+# interval_secs = 30
+
+# Keep using the current AFTR IPv6 for this long after it disappears from DNS.
+# aftr_missing_grace_secs = 600

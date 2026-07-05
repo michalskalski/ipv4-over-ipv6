@@ -5,8 +5,9 @@ use dslite_b4::tunnel::illumos::IllumosBackend;
 #[cfg(target_os = "linux")]
 use dslite_b4::tunnel::linux::LinuxBackend;
 use dslite_b4::{
+    aftr::AftrSelector,
     config::{AftrAddress, Config},
-    dns::resolve_aftr,
+    dns::resolve_aftr_addresses,
     lifecycle::{Desired, reconcile_once},
     network_changes::NetworkChanges,
     runtime_state::{
@@ -16,7 +17,7 @@ use dslite_b4::{
 };
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::signal;
 
@@ -78,11 +79,12 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
     let mut sigusr1 = signal::unix::signal(signal::unix::SignalKind::user_defined1())?;
     let mut network_changes = NetworkChanges::new()?;
+    let mut aftr_selector = AftrSelector::new();
     let mut attempt: u64 = 0;
     loop {
         let observed = backend.observe().await?;
-        let preferred_aftr = preferred_aftr(&observed);
-        let desired = compute_desired(config, preferred_aftr).await?;
+        let current_aftr = current_aftr(&observed);
+        let desired = compute_desired(config, &mut aftr_selector, current_aftr).await?;
         let action = reconcile_once(&backend, &observed, &desired).await?;
         tracing::info!(?action, "reconciliation completed");
 
@@ -100,7 +102,7 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
         };
         tokio::select! {
             _ = tokio::time::sleep(delay) => {},
-            result = network_changes.changed() => { result?; attempt = 0; }
+            result = network_changes.changed() => { result?; }
             _ = sigusr1.recv() => {
                 tracing::debug!("runtime state refresh requested");
                 attempt = 0;
@@ -114,7 +116,7 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
     Ok(())
 }
 
-fn preferred_aftr(observed: &Observed) -> Option<std::net::Ipv6Addr> {
+fn current_aftr(observed: &Observed) -> Option<std::net::Ipv6Addr> {
     match observed {
         Observed::Present { remote_v6, .. } => Some(*remote_v6),
         Observed::Absent => None,
@@ -123,18 +125,24 @@ fn preferred_aftr(observed: &Observed) -> Option<std::net::Ipv6Addr> {
 
 async fn compute_desired(
     config: &Config,
-    preferred_aftr: Option<std::net::Ipv6Addr>,
+    aftr_selector: &mut AftrSelector,
+    current_aftr: Option<std::net::Ipv6Addr>,
 ) -> anyhow::Result<Desired> {
     let Some(aftr) = effective_aftr(config)? else {
         tracing::debug!("no AFTR source available");
         return Ok(Desired::Unavailable);
     };
-    let aftr_ip = match resolve_aftr(&aftr, preferred_aftr).await {
-        Ok(addr) => addr,
+    let aftr_candidates = match resolve_aftr_addresses(&aftr).await {
+        Ok(addrs) => addrs,
         Err(e) => {
             tracing::warn!(error = %e, "AFTR resolution unavailable");
             return Ok(Desired::Unavailable);
         }
+    };
+    let grace = Duration::from_secs(config.health.aftr_missing_grace_secs);
+    let Some(aftr_ip) = aftr_selector.select(&aftr_candidates, current_aftr, grace, Instant::now())
+    else {
+        return Ok(Desired::Unavailable);
     };
     let local_v6 = match config.tunnel.local_v6 {
         Some(addr) => addr,

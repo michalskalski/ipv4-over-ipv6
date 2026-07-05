@@ -70,6 +70,8 @@ pub struct AftrConfig {
 pub struct HealthConfig {
     #[serde(default = "default_health_interval")]
     pub interval_secs: NonZeroU64,
+    #[serde(default = "default_aftr_missing_grace_secs")]
+    pub aftr_missing_grace_secs: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -100,4 +102,8 @@ fn default_tunnel_local_v4() -> Ipv4Addr {
 
 fn default_runtime_state_dir() -> PathBuf {
     PathBuf::from("/var/run/dslite-b4")
+}
+
+fn default_aftr_missing_grace_secs() -> u64 {
+    600
 }

@@ -1,3 +1,4 @@
+pub mod aftr;
 pub mod config;
 pub mod discovery;
 pub mod dns;
