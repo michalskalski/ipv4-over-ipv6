@@ -41,10 +41,10 @@ fn decide(observed: &Observed, desired: &Desired) -> Action {
 
 pub async fn reconcile_once<B: TunnelBackend>(
     backend: &B,
+    observed: &Observed,
     desired: &Desired,
 ) -> Result<Action, TunnelError> {
-    let observed = backend.observe().await?;
-    let action = decide(&observed, desired);
+    let action = decide(observed, desired);
 
     match action {
         Action::Create(state) => backend.setup(state).await?,
@@ -123,9 +123,10 @@ mod tests {
     #[tokio::test]
     async fn reconcile_creates_absent_tunnel() {
         let backend = fake(Observed::Absent);
+        let observed = backend.observe().await.unwrap();
         let desired = desired(Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED);
 
-        let action = reconcile_once(&backend, &desired).await.unwrap();
+        let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
         assert!(matches!(action, Action::Create(_)));
         assert_eq!(calls(&backend), [Call::Observe, Call::Setup]);
@@ -140,9 +141,10 @@ mod tests {
             remote_v6,
             admin_up: false,
         });
+        let observed = backend.observe().await.unwrap();
         let desired = desired(local_v6, remote_v6);
 
-        let action = reconcile_once(&backend, &desired).await.unwrap();
+        let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
         assert_eq!(action, Action::BringUp);
         assert_eq!(calls(&backend), [Call::Observe, Call::BringUp]);
@@ -159,8 +161,9 @@ mod tests {
             Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
             Ipv6Addr::UNSPECIFIED,
         );
+        let observed = backend.observe().await.unwrap();
 
-        let action = reconcile_once(&backend, &desired).await.unwrap();
+        let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
         assert!(matches!(action, Action::Rebuild(_)));
         assert_eq!(
@@ -179,8 +182,9 @@ mod tests {
             admin_up: true,
         });
         let desired = desired(local_v6, remote_v6);
+        let observed = backend.observe().await.unwrap();
 
-        let action = reconcile_once(&backend, &desired).await.unwrap();
+        let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
         assert_eq!(action, Action::Noop);
         assert_eq!(calls(&backend), [Call::Observe]);
@@ -193,8 +197,9 @@ mod tests {
             remote_v6: Ipv6Addr::UNSPECIFIED,
             admin_up: true,
         });
+        let observed = backend.observe().await.unwrap();
 
-        let action = reconcile_once(&backend, &Desired::Unavailable)
+        let action = reconcile_once(&backend, &observed, &Desired::Unavailable)
             .await
             .unwrap();
 

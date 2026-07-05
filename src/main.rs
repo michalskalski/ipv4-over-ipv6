@@ -6,13 +6,13 @@ use dslite_b4::tunnel::illumos::IllumosBackend;
 use dslite_b4::tunnel::linux::LinuxBackend;
 use dslite_b4::{
     config::{AftrAddress, Config},
-    dns::resolve,
+    dns::resolve_aftr,
     lifecycle::{Desired, reconcile_once},
     network_changes::NetworkChanges,
     runtime_state::{
         self, PidFile, clear_provided_aftr, signal_daemon_refresh, write_provided_aftr,
     },
-    tunnel::{DesiredState, TunnelBackend},
+    tunnel::{DesiredState, Observed, TunnelBackend},
 };
 use std::{
     path::{Path, PathBuf},
@@ -80,8 +80,10 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
     let mut network_changes = NetworkChanges::new()?;
     let mut attempt: u64 = 0;
     loop {
-        let desired = compute_desired(config).await?;
-        let action = reconcile_once(&backend, &desired).await?;
+        let observed = backend.observe().await?;
+        let preferred_aftr = preferred_aftr(&observed);
+        let desired = compute_desired(config, preferred_aftr).await?;
+        let action = reconcile_once(&backend, &observed, &desired).await?;
         tracing::info!(?action, "reconciliation completed");
 
         let delay = match desired {
@@ -112,12 +114,22 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
     Ok(())
 }
 
-async fn compute_desired(config: &Config) -> anyhow::Result<Desired> {
+fn preferred_aftr(observed: &Observed) -> Option<std::net::Ipv6Addr> {
+    match observed {
+        Observed::Present { remote_v6, .. } => Some(*remote_v6),
+        Observed::Absent => None,
+    }
+}
+
+async fn compute_desired(
+    config: &Config,
+    preferred_aftr: Option<std::net::Ipv6Addr>,
+) -> anyhow::Result<Desired> {
     let Some(aftr) = effective_aftr(config)? else {
         tracing::debug!("no AFTR source available");
         return Ok(Desired::Unavailable);
     };
-    let aftr_ip = match resolve(&aftr).await {
+    let aftr_ip = match resolve_aftr(&aftr, preferred_aftr).await {
         Ok(addr) => addr,
         Err(e) => {
             tracing::warn!(error = %e, "AFTR resolution unavailable");
