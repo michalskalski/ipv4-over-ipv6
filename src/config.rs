@@ -10,6 +10,8 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub tunnel: TunnelConfig,
     pub aftr: AftrConfig,
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
     pub health: HealthConfig,
 }
 
@@ -66,6 +68,91 @@ pub struct AftrConfig {
     pub address: Option<AftrAddress>,
 }
 
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryMethod {
+    #[default]
+    None,
+    V6mig,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct DiscoveryConfig {
+    #[serde(default)]
+    pub method: DiscoveryMethod,
+    #[serde(
+        default = "default_discovery_vendorid",
+        deserialize_with = "deserialize_v6mig_vendorid"
+    )]
+    pub vendor_id: String,
+    #[serde(
+        default = "default_discovery_product",
+        deserialize_with = "deserialize_v6mig_product"
+    )]
+    pub product: String,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            method: DiscoveryMethod::None,
+            vendor_id: default_discovery_vendorid(),
+            product: default_discovery_product(),
+        }
+    }
+}
+
+fn deserialize_v6mig_vendorid<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(d)?;
+    let (oui, suffix) = match value.split_once('-') {
+        Some((oui, suffix)) => (oui, Some(suffix)),
+        None => (value.as_str(), None),
+    };
+
+    if oui.len() != 6 || !oui.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(serde::de::Error::custom(
+            "discovery.vendor_id must start with 6 ASCII hex digits",
+        ));
+    }
+
+    if let Some(suffix) = suffix
+        && (suffix.is_empty()
+            || suffix.len() > 24
+            || !suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return Err(serde::de::Error::custom(
+            "discovery.vendor_id suffix must be 1..24 ASCII letters, digits, or '_'",
+        ));
+    }
+
+    Ok(value)
+}
+
+fn deserialize_v6mig_product<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(d)?;
+
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(serde::de::Error::custom(
+            "discovery.product must be 1..32 ASCII letters, digits, '_' or '-'",
+        ));
+    }
+
+    Ok(value)
+}
+
 #[derive(Deserialize, Debug)]
 pub struct HealthConfig {
     #[serde(default = "default_health_interval")]
@@ -106,4 +193,12 @@ fn default_runtime_state_dir() -> PathBuf {
 
 fn default_aftr_missing_grace_secs() -> u64 {
     600
+}
+
+fn default_discovery_vendorid() -> String {
+    "000000".into()
+}
+
+fn default_discovery_product() -> String {
+    "dslite-b4".into()
 }

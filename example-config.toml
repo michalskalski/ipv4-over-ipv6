@@ -11,6 +11,12 @@ local_v4 = "192.0.0.2"
 # Optional static override. If omitted, the daemon reads runtime AFTR state.
 address = "2001:db8::2"
 
+[discovery]
+# Automatic AFTR discovery is opt-in.
+method = "none"
+# vendor_id = "000000"
+# product = "dslite-b4"
+
 [health]
 # Periodic reconciliation interval. Network-change and runtime-state hints wake sooner.
 # interval_secs = 30
