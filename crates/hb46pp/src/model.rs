@@ -682,11 +682,17 @@ impl fmt::Debug for ProvisioningRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsPolicy {
+    NoCertificateValidation, // t=a
+    ValidateCertificate,     // t=b
+}
+
 #[derive(Debug)]
-struct Bootstrap {
+pub struct Bootstrap {
     url: Url,
     host: Host<String>,
-    validate_tls: bool,
+    tls_policy: TlsPolicy,
 }
 
 impl Bootstrap {
@@ -711,9 +717,9 @@ impl Bootstrap {
             return Err(BootstrapError::InvalidRecord(txt.to_string()));
         };
 
-        let validate_tls = match tls_value {
-            "a" => false,
-            "b" => true,
+        let tls_policy = match tls_value {
+            "a" => TlsPolicy::NoCertificateValidation,
+            "b" => TlsPolicy::ValidateCertificate,
             _ => {
                 return Err(BootstrapError::InvalidTlsPolicy(format!(
                     "invalid tls policy value: {tls_value}, expected '<a|b>'"
@@ -734,7 +740,7 @@ impl Bootstrap {
             ));
         };
 
-        if url.scheme() == "http" && validate_tls {
+        if url.scheme() == "http" && tls_policy == TlsPolicy::ValidateCertificate {
             return Err(BootstrapError::InvalidTlsForHttp);
         }
 
@@ -743,7 +749,7 @@ impl Bootstrap {
         Ok(Bootstrap {
             url,
             host,
-            validate_tls,
+            tls_policy,
         })
     }
 
@@ -784,7 +790,7 @@ impl Bootstrap {
         if self.url.scheme() != "https" {
             return Err(ProvisioningUrlError::CredentialsRequireHttps);
         }
-        if !self.validate_tls {
+        if self.tls_policy != TlsPolicy::ValidateCertificate {
             return Err(ProvisioningUrlError::CredentialsRequireCertificateValidation);
         }
 
@@ -793,6 +799,14 @@ impl Bootstrap {
         }
 
         Ok(())
+    }
+
+    pub fn tls_policy(&self) -> TlsPolicy {
+        self.tls_policy
+    }
+
+    pub fn endpoint(&self) -> &Url {
+        &self.url
     }
 }
 
@@ -1213,18 +1227,18 @@ mod tests {
         let bootstrap = Bootstrap::parse(V6CONNECT_BOOTSTRAP).unwrap();
 
         assert_eq!(
-            bootstrap.url.as_str(),
+            bootstrap.endpoint().as_str(),
             "https://prod.v6mig.v6connect.net/cpe/v1/config"
         );
-        assert!(bootstrap.validate_tls);
+        assert_eq!(bootstrap.tls_policy(), TlsPolicy::ValidateCertificate);
     }
 
     #[test]
     fn accepts_http_without_tls_validation() {
         let bootstrap = Bootstrap::parse("v=v6mig-1 url=http://vne.example/rule.cgi t=a").unwrap();
 
-        assert_eq!(bootstrap.url.scheme(), "http");
-        assert!(!bootstrap.validate_tls);
+        assert_eq!(bootstrap.endpoint().scheme(), "http");
+        assert_eq!(bootstrap.tls_policy(), TlsPolicy::NoCertificateValidation);
     }
 
     #[test]
