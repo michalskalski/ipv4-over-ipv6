@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires tunnel state prepared by scripts/test-illumos-observe.sh"]
+    #[ignore = "requires tunnel state prepared by crates/dslite-b4/scripts/test-illumos-observe.sh"]
     async fn observes_illumos_tunnel() {
         let name = std::env::var("DSLITE_TEST_TUNNEL")
             .expect("DSLITE_TEST_TUNNEL must name the prepared test tunnel");
@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires tunnel state prepared by scripts/test-illumos-observe.sh"]
+    #[ignore = "requires tunnel state prepared by crates/dslite-b4/scripts/test-illumos-observe.sh"]
     async fn brings_up_illumos_tunnel() {
         let name = std::env::var("DSLITE_TEST_TUNNEL")
             .expect("DSLITE_TEST_TUNNEL must name the prepared test tunnel");

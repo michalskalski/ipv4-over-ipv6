@@ -93,7 +93,7 @@ unsafe extern "C" {
 // Used for the SIOCSLIF* ioctls that assign the IPv4 address directly,
 // bypassing libipadm (issue 17851). The kernel reads/writes our memory
 // at this layout, so it must match C exactly. Layout verified on OmniOS
-// r151054 via scripts/probe_lifreq.c, re-run that probe if the size
+// r151054 via crates/dslite-b4/scripts/probe_lifreq.c, re-run that probe if the size
 // assertion below ever fails.
 //
 // Initialized via `MaybeUninit::zeroed().assume_init()` rather than a

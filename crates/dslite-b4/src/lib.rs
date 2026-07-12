@@ -6,7 +6,6 @@ pub mod lifecycle;
 pub mod network_changes;
 pub mod runtime_state;
 pub mod tunnel;
-pub mod v6mig;
 
 #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
 compile_error!("dslite-b4 only supports Linux and illumos");

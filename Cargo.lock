@@ -159,13 +159,11 @@ dependencies = [
  "libc",
  "rtnetlink",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -286,6 +284,16 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
+name = "hb46pp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+]
 
 [[package]]
 name = "heck"
