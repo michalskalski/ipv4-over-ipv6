@@ -1,9 +1,12 @@
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use url::{Host, Url};
 
 const V6MIG_SPEC: &str = "v6mig-1";
+const MAX_TTL_SECS: u64 = 604_800;
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
@@ -25,7 +28,7 @@ pub enum BootstrapError {
     InvalidRecord(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
     Xlat464,
     DsLite,
@@ -36,6 +39,15 @@ pub enum Capability {
 }
 
 impl Capability {
+    const ALL: [Self; 6] = [
+        Self::Xlat464,
+        Self::DsLite,
+        Self::IpIp,
+        Self::Lw4o6,
+        Self::MapE,
+        Self::MapT,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Xlat464 => "464xlat",
@@ -58,16 +70,316 @@ impl FromStr for Capability {
     type Err = CapabilityError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "464xlat" => Ok(Self::Xlat464),
-            "dslite" => Ok(Self::DsLite),
-            "ipip" => Ok(Self::IpIp),
-            "lw4o6" => Ok(Self::Lw4o6),
-            "map_e" => Ok(Self::MapE),
-            "map_t" => Ok(Self::MapT),
-            _ => Err(CapabilityError::UnsupportedName(value.to_string())),
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.as_str() == value)
+            .ok_or_else(|| CapabilityError::UnsupportedName(value.to_string()))
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TtlError {
+    #[error("TTL must be at most {MAX_TTL_SECS} seconds")]
+    TooLarge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ttl(u32);
+
+impl Ttl {
+    pub fn as_secs(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for Ttl {
+    type Error = TtlError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value > MAX_TTL_SECS {
+            return Err(TtlError::TooLarge);
+        }
+
+        Ok(Self(value as u32))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStatus {
+    Required,
+    Rejected,
+    Accepted,
+}
+
+impl AuthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "req",
+            Self::Rejected => "bad",
+            Self::Accepted => "ok",
         }
     }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AuthStatusError {
+    #[error("unsupported HB46PP auth status: {0}")]
+    UnsupportedStatus(String),
+}
+
+impl FromStr for AuthStatus {
+    type Err = AuthStatusError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "req" => Ok(Self::Required),
+            "bad" => Ok(Self::Rejected),
+            "ok" => Ok(Self::Accepted),
+            _ => Err(AuthStatusError::UnsupportedStatus(value.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInfo {
+    enabler_name: String,
+    service_name: Option<String>,
+    isp_name: Option<String>,
+}
+
+impl ProviderInfo {
+    pub fn enabler_name(&self) -> &str {
+        &self.enabler_name
+    }
+
+    pub fn service_name(&self) -> Option<&str> {
+        self.service_name.as_deref()
+    }
+
+    pub fn isp_name(&self) -> Option<&str> {
+        self.isp_name.as_deref()
+    }
+}
+
+pub struct SelectedOffer<'a> {
+    capability: Capability,
+    parameters: &'a serde_json::Value,
+}
+
+impl SelectedOffer<'_> {
+    pub fn capability(&self) -> Capability {
+        self.capability
+    }
+
+    pub fn parameters(&self) -> &serde_json::Value {
+        self.parameters
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ProvisioningResponseError {
+    #[error("response is not a JSON object")]
+    NotObject,
+    #[error("missing required response field: {0}")]
+    MissingField(&'static str),
+    #[error("response field must not be null: {0}")]
+    NullField(&'static str),
+    #[error("invalid response field {field}: {source}")]
+    InvalidField {
+        field: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("response field exceeds 256 bytes including quotes: {0}")]
+    InformationalNameTooLong(&'static str),
+    #[error(transparent)]
+    Ttl(#[from] TtlError),
+    #[error(transparent)]
+    Token(#[from] TokenError),
+    #[error(transparent)]
+    AuthStatus(#[from] AuthStatusError),
+    #[error(transparent)]
+    Capability(#[from] CapabilityError),
+    #[error("duplicate capability in response order: {0:?}")]
+    DuplicateOrder(Capability),
+    #[error("response order lists a method without its provisioning payload: {0:?}")]
+    MissingOffer(Capability),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningResponse {
+    provider_info: ProviderInfo,
+    ttl: Option<Ttl>,
+    token: Option<Token>,
+    auth: Option<AuthStatus>,
+    order: Vec<Capability>,
+    ipv6_mostly: Option<bool>,
+    offers: BTreeMap<Capability, Value>,
+}
+
+impl ProvisioningResponse {
+    pub fn parse(input: &str) -> Result<Self, ProvisioningResponseError> {
+        let value = serde_json::from_str(input).map_err(|source| {
+            ProvisioningResponseError::InvalidField {
+                field: "response",
+                source,
+            }
+        })?;
+        let mut fields = match value {
+            Value::Object(fields) => fields,
+            _ => return Err(ProvisioningResponseError::NotObject),
+        };
+
+        let enabler_name = take_required::<String>(&mut fields, "enabler_name")?;
+        validate_informational_name("enabler_name", &enabler_name)?;
+        let service_name = take_optional::<String>(&mut fields, "service_name")?;
+        if let Some(service_name) = &service_name {
+            validate_informational_name("service_name", service_name)?;
+        }
+        let isp_name = take_optional::<String>(&mut fields, "isp_name")?;
+        if let Some(isp_name) = &isp_name {
+            validate_informational_name("isp_name", isp_name)?;
+        }
+
+        let ttl = take_optional::<u64>(&mut fields, "ttl")
+            .map(|ttl| ttl.map(Ttl::try_from).transpose())??;
+        let token = take_optional::<String>(&mut fields, "token")
+            .map(|token| token.map(|token| token.parse()).transpose())??;
+        let auth = take_optional::<String>(&mut fields, "auth")
+            .map(|auth| auth.map(|auth| auth.parse()).transpose())??;
+        let order_names = take_required::<Vec<String>>(&mut fields, "order")?;
+        let ipv6_mostly = take_optional::<bool>(&mut fields, "ipv6_mostly")?;
+
+        let mut order = Vec::with_capacity(order_names.len());
+        for name in order_names {
+            let capability = name.parse()?;
+            if order.contains(&capability) {
+                return Err(ProvisioningResponseError::DuplicateOrder(capability));
+            }
+            order.push(capability);
+        }
+
+        let mut offers = BTreeMap::new();
+        for capability in Capability::ALL {
+            if let Some(parameters) = fields.remove(capability.as_str()) {
+                offers.insert(capability, parameters);
+            }
+        }
+        for capability in &order {
+            if !offers.contains_key(capability) {
+                return Err(ProvisioningResponseError::MissingOffer(*capability));
+            }
+        }
+
+        Ok(Self {
+            provider_info: ProviderInfo {
+                enabler_name,
+                service_name,
+                isp_name,
+            },
+            ttl,
+            token,
+            auth,
+            order,
+            ipv6_mostly,
+            offers,
+        })
+    }
+
+    pub fn select(&self, supported: &[Capability]) -> Option<SelectedOffer<'_>> {
+        for &capability in self.order() {
+            if !supported.contains(&capability) {
+                continue;
+            }
+
+            let Some(parameters) = self.offer(capability) else {
+                continue;
+            };
+
+            return Some(SelectedOffer {
+                capability,
+                parameters,
+            });
+        }
+
+        None
+    }
+
+    pub fn provider_info(&self) -> &ProviderInfo {
+        &self.provider_info
+    }
+
+    pub fn ttl(&self) -> Option<Ttl> {
+        self.ttl
+    }
+
+    pub fn token(&self) -> Option<&Token> {
+        self.token.as_ref()
+    }
+
+    pub fn auth(&self) -> Option<AuthStatus> {
+        self.auth
+    }
+
+    pub fn order(&self) -> &[Capability] {
+        &self.order
+    }
+
+    pub fn ipv6_mostly(&self) -> Option<bool> {
+        self.ipv6_mostly
+    }
+
+    pub fn offer(&self, capability: Capability) -> Option<&Value> {
+        self.offers.get(&capability)
+    }
+}
+
+fn take_required<T>(
+    fields: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<T, ProvisioningResponseError>
+where
+    T: DeserializeOwned,
+{
+    let value = fields
+        .remove(field)
+        .ok_or(ProvisioningResponseError::MissingField(field))?;
+    if value.is_null() {
+        return Err(ProvisioningResponseError::NullField(field));
+    }
+
+    serde_json::from_value(value)
+        .map_err(|source| ProvisioningResponseError::InvalidField { field, source })
+}
+
+fn take_optional<T>(
+    fields: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<T>, ProvisioningResponseError>
+where
+    T: DeserializeOwned,
+{
+    let Some(value) = fields.remove(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Err(ProvisioningResponseError::NullField(field));
+    }
+
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|source| ProvisioningResponseError::InvalidField { field, source })
+}
+
+fn validate_informational_name(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ProvisioningResponseError> {
+    if value.len() + 2 > 256 {
+        return Err(ProvisioningResponseError::InformationalNameTooLong(field));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -256,13 +568,11 @@ pub enum TokenError {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token {
-    token: String,
-}
+pub struct Token(String);
 
 impl Token {
     pub fn as_str(&self) -> &str {
-        &self.token
+        &self.0
     }
 }
 
@@ -280,9 +590,7 @@ impl FromStr for Token {
             return Err(TokenError::InvalidFormat);
         }
 
-        Ok(Self {
-            token: value.to_string(),
-        })
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -546,16 +854,10 @@ mod tests {
 
     #[test]
     fn serializes_capabilities_to_hb46pp_wire_names() {
-        let capabilities = [
-            Capability::Xlat464,
-            Capability::DsLite,
-            Capability::IpIp,
-            Capability::Lw4o6,
-            Capability::MapE,
-            Capability::MapT,
-        ];
-
-        let names: Vec<_> = capabilities.into_iter().map(Capability::as_str).collect();
+        let names: Vec<_> = Capability::ALL
+            .into_iter()
+            .map(Capability::as_str)
+            .collect();
 
         assert_eq!(
             names,
@@ -565,16 +867,7 @@ mod tests {
 
     #[test]
     fn parses_hb46pp_capability_wire_names() {
-        let capabilities = [
-            Capability::Xlat464,
-            Capability::DsLite,
-            Capability::IpIp,
-            Capability::Lw4o6,
-            Capability::MapE,
-            Capability::MapT,
-        ];
-
-        for capability in capabilities {
+        for capability in Capability::ALL {
             assert_eq!(capability.as_str().parse(), Ok(capability));
         }
     }
@@ -586,6 +879,205 @@ mod tests {
 
             assert_eq!(error, CapabilityError::UnsupportedName(name.to_string()));
         }
+    }
+
+    #[test]
+    fn accepts_ttl_at_the_specification_limit() {
+        let ttl = Ttl::try_from(604_800).unwrap();
+
+        assert_eq!(ttl.as_secs(), 604_800);
+    }
+
+    #[test]
+    fn rejects_ttl_above_the_specification_limit() {
+        let error = Ttl::try_from(604_801).unwrap_err();
+
+        assert_eq!(error, TtlError::TooLarge);
+    }
+
+    #[test]
+    fn parses_hb46pp_auth_statuses() {
+        for (wire_name, status) in [
+            ("req", AuthStatus::Required),
+            ("bad", AuthStatus::Rejected),
+            ("ok", AuthStatus::Accepted),
+        ] {
+            assert_eq!(wire_name.parse(), Ok(status));
+            assert_eq!(status.as_str(), wire_name);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_hb46pp_auth_status() {
+        let error = "required".parse::<AuthStatus>().unwrap_err();
+
+        assert_eq!(
+            error,
+            AuthStatusError::UnsupportedStatus("required".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_v6connect_response_shape() {
+        let response = ProvisioningResponse::parse(&format!(
+            r#"{{
+                "ttl": 86400,
+                "token": "{TOKEN}",
+                "service_name": "v6 コネクト",
+                "enabler_name": "v6 コネクト",
+                "dslite": {{"aftr": "dslite.v6connect.net"}},
+                "order": ["dslite"],
+                "future_extension": {{"ignored": true}}
+            }}"#
+        ))
+        .unwrap();
+
+        assert_eq!(response.provider_info().enabler_name(), "v6 コネクト");
+        assert_eq!(response.provider_info().service_name(), Some("v6 コネクト"));
+        assert_eq!(response.provider_info().isp_name(), None);
+        assert_eq!(response.ttl().unwrap().as_secs(), 86_400);
+        assert_eq!(response.token().unwrap().as_str(), TOKEN);
+        assert_eq!(response.auth(), None);
+        assert_eq!(response.order(), [Capability::DsLite]);
+        assert_eq!(
+            response.offer(Capability::DsLite),
+            Some(&serde_json::json!({"aftr": "dslite.v6connect.net"}))
+        );
+    }
+
+    #[test]
+    fn retains_ipv6_mostly_xlat_offer_outside_activation_order() {
+        let response = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["dslite"],
+                "ipv6_mostly": true,
+                "dslite": {"aftr": "dslite.example"},
+                "464xlat": {"nat64prefix": "64:ff9b::/96"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.order(), [Capability::DsLite]);
+        assert_eq!(response.ipv6_mostly(), Some(true));
+        assert_eq!(
+            response.offer(Capability::Xlat464),
+            Some(&serde_json::json!({"nat64prefix": "64:ff9b::/96"}))
+        );
+    }
+
+    #[test]
+    fn selects_the_first_server_ordered_supported_offer() {
+        let response = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["map_e", "dslite"],
+                "map_e": {"br": "2001:db8::1", "rules": []},
+                "dslite": {"aftr": "dslite.example"}
+            }"#,
+        )
+        .unwrap();
+
+        let selected = response
+            .select(&[Capability::DsLite, Capability::MapE])
+            .unwrap();
+
+        assert_eq!(selected.capability(), Capability::MapE);
+        assert_eq!(
+            selected.parameters(),
+            &serde_json::json!({"br": "2001:db8::1", "rules": []})
+        );
+    }
+
+    #[test]
+    fn selects_a_later_offer_when_higher_priority_offers_are_unsupported() {
+        let response = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["map_e", "dslite"],
+                "map_e": {"br": "2001:db8::1", "rules": []},
+                "dslite": {"aftr": "dslite.example"}
+            }"#,
+        )
+        .unwrap();
+
+        let selected = response.select(&[Capability::DsLite]).unwrap();
+
+        assert_eq!(selected.capability(), Capability::DsLite);
+        assert_eq!(
+            selected.parameters(),
+            &serde_json::json!({"aftr": "dslite.example"})
+        );
+    }
+
+    #[test]
+    fn selects_nothing_when_no_ordered_offer_is_supported() {
+        let response = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["map_e"],
+                "map_e": {"br": "2001:db8::1", "rules": []}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(response.select(&[Capability::DsLite]).is_none());
+    }
+
+    #[test]
+    fn rejects_null_for_an_optional_response_field() {
+        let error = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "token": null,
+                "order": []
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProvisioningResponseError::NullField("token")
+        ));
+    }
+
+    #[test]
+    fn rejects_an_ordered_capability_without_a_payload() {
+        let error = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["dslite"]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProvisioningResponseError::MissingOffer(Capability::DsLite)
+        ));
+    }
+
+    #[test]
+    fn validates_ttl_and_token_in_a_response() {
+        let ttl_error = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "ttl": 604801,
+                "order": []
+            }"#,
+        )
+        .unwrap_err();
+        let token_error = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "token": "not-a-token",
+                "order": []
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(ttl_error, ProvisioningResponseError::Ttl(_)));
+        assert!(matches!(token_error, ProvisioningResponseError::Token(_)));
     }
 
     #[test]
