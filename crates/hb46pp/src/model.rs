@@ -261,8 +261,10 @@ impl ProvisioningResponse {
 
         let mut offers = BTreeMap::new();
         for capability in Capability::ALL {
-            if let Some(parameters) = fields.remove(capability.as_str()) {
-                offers.insert(capability, parameters);
+            if let Some(parameters) =
+                take_optional::<Map<String, Value>>(&mut fields, capability.as_str())?
+            {
+                offers.insert(capability, Value::Object(parameters));
             }
         }
         for capability in &order {
@@ -683,12 +685,19 @@ impl fmt::Debug for ProvisioningRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The certificate-validation policy declared by an HB46PP bootstrap record.
 pub enum TlsPolicy {
+    /// Bootstrap field `t=a`: certificate validation is not required.
     NoCertificateValidation, // t=a
-    ValidateCertificate,     // t=b
+    /// Bootstrap field `t=b`: validate the HTTPS server certificate.
+    ValidateCertificate, // t=b
 }
 
 #[derive(Debug)]
+/// A validated HB46PP bootstrap record.
+///
+/// It contains the provisioning endpoint and TLS policy obtained from a DNS
+/// TXT record.
 pub struct Bootstrap {
     url: Url,
     host: Host<String>,
@@ -696,6 +705,7 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
+    /// Parses and validates an HB46PP bootstrap TXT record.
     pub fn parse(txt: &str) -> Result<Self, BootstrapError> {
         let mut iter = txt.split(' ');
 
@@ -753,6 +763,10 @@ impl Bootstrap {
         })
     }
 
+    /// Builds the provisioning URL for the initial bootstrap endpoint.
+    ///
+    /// The returned URL preserves endpoint query parameters and adds the
+    /// request's HB46PP query parameters.
     pub fn provisioning_url(
         &self,
         request: &ProvisioningRequest,
@@ -801,10 +815,12 @@ impl Bootstrap {
         Ok(())
     }
 
+    /// Returns the TLS policy declared by the bootstrap record.
     pub fn tls_policy(&self) -> TlsPolicy {
         self.tls_policy
     }
 
+    /// Returns the provisioning endpoint from the bootstrap record.
     pub fn endpoint(&self) -> &Url {
         &self.url
     }
@@ -1052,6 +1068,26 @@ mod tests {
         assert!(matches!(
             error,
             ProvisioningResponseError::NullField("token")
+        ));
+    }
+
+    #[test]
+    fn rejects_non_object_method_payload() {
+        let error = ProvisioningResponse::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["dslite"],
+                "dslite": "invalid"
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProvisioningResponseError::InvalidField {
+                field: "dslite",
+                ..
+            }
         ));
     }
 
