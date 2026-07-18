@@ -177,7 +177,7 @@ impl SelectedOffer<'_> {
 }
 
 #[derive(Debug, Error)]
-pub enum ProvisioningResponseError {
+pub enum ProvisioningDataError {
     #[error("response is not a JSON object")]
     NotObject,
     #[error("missing required response field: {0}")]
@@ -207,7 +207,7 @@ pub enum ProvisioningResponseError {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProvisioningResponse {
+pub struct ProvisioningData {
     provider_info: ProviderInfo,
     ttl: Option<Ttl>,
     token: Option<Token>,
@@ -217,17 +217,16 @@ pub struct ProvisioningResponse {
     offers: BTreeMap<Capability, Value>,
 }
 
-impl ProvisioningResponse {
-    pub fn parse(input: &str) -> Result<Self, ProvisioningResponseError> {
-        let value = serde_json::from_str(input).map_err(|source| {
-            ProvisioningResponseError::InvalidField {
+impl ProvisioningData {
+    pub fn parse(input: &str) -> Result<Self, ProvisioningDataError> {
+        let value =
+            serde_json::from_str(input).map_err(|source| ProvisioningDataError::InvalidField {
                 field: "response",
                 source,
-            }
-        })?;
+            })?;
         let mut fields = match value {
             Value::Object(fields) => fields,
-            _ => return Err(ProvisioningResponseError::NotObject),
+            _ => return Err(ProvisioningDataError::NotObject),
         };
 
         let enabler_name = take_required::<String>(&mut fields, "enabler_name")?;
@@ -254,7 +253,7 @@ impl ProvisioningResponse {
         for name in order_names {
             let capability = name.parse()?;
             if order.contains(&capability) {
-                return Err(ProvisioningResponseError::DuplicateOrder(capability));
+                return Err(ProvisioningDataError::DuplicateOrder(capability));
             }
             order.push(capability);
         }
@@ -269,7 +268,7 @@ impl ProvisioningResponse {
         }
         for capability in &order {
             if !offers.contains_key(capability) {
-                return Err(ProvisioningResponseError::MissingOffer(*capability));
+                return Err(ProvisioningDataError::MissingOffer(*capability));
             }
         }
 
@@ -339,25 +338,25 @@ impl ProvisioningResponse {
 fn take_required<T>(
     fields: &mut Map<String, Value>,
     field: &'static str,
-) -> Result<T, ProvisioningResponseError>
+) -> Result<T, ProvisioningDataError>
 where
     T: DeserializeOwned,
 {
     let value = fields
         .remove(field)
-        .ok_or(ProvisioningResponseError::MissingField(field))?;
+        .ok_or(ProvisioningDataError::MissingField(field))?;
     if value.is_null() {
-        return Err(ProvisioningResponseError::NullField(field));
+        return Err(ProvisioningDataError::NullField(field));
     }
 
     serde_json::from_value(value)
-        .map_err(|source| ProvisioningResponseError::InvalidField { field, source })
+        .map_err(|source| ProvisioningDataError::InvalidField { field, source })
 }
 
 fn take_optional<T>(
     fields: &mut Map<String, Value>,
     field: &'static str,
-) -> Result<Option<T>, ProvisioningResponseError>
+) -> Result<Option<T>, ProvisioningDataError>
 where
     T: DeserializeOwned,
 {
@@ -365,20 +364,20 @@ where
         return Ok(None);
     };
     if value.is_null() {
-        return Err(ProvisioningResponseError::NullField(field));
+        return Err(ProvisioningDataError::NullField(field));
     }
 
     serde_json::from_value(value)
         .map(Some)
-        .map_err(|source| ProvisioningResponseError::InvalidField { field, source })
+        .map_err(|source| ProvisioningDataError::InvalidField { field, source })
 }
 
 fn validate_informational_name(
     field: &'static str,
     value: &str,
-) -> Result<(), ProvisioningResponseError> {
+) -> Result<(), ProvisioningDataError> {
     if value.len() + 2 > 256 {
-        return Err(ProvisioningResponseError::InformationalNameTooLong(field));
+        return Err(ProvisioningDataError::InformationalNameTooLong(field));
     }
 
     Ok(())
@@ -982,7 +981,7 @@ mod tests {
 
     #[test]
     fn parses_v6connect_response_shape() {
-        let response = ProvisioningResponse::parse(&format!(
+        let response = ProvisioningData::parse(&format!(
             r#"{{
                 "ttl": 86400,
                 "token": "{TOKEN}",
@@ -1010,7 +1009,7 @@ mod tests {
 
     #[test]
     fn retains_ipv6_mostly_xlat_offer_outside_activation_order() {
-        let response = ProvisioningResponse::parse(
+        let response = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["dslite"],
@@ -1031,7 +1030,7 @@ mod tests {
 
     #[test]
     fn selects_the_first_server_ordered_supported_offer() {
-        let response = ProvisioningResponse::parse(
+        let response = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["map_e", "dslite"],
@@ -1054,7 +1053,7 @@ mod tests {
 
     #[test]
     fn selects_a_later_offer_when_higher_priority_offers_are_unsupported() {
-        let response = ProvisioningResponse::parse(
+        let response = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["map_e", "dslite"],
@@ -1075,7 +1074,7 @@ mod tests {
 
     #[test]
     fn selects_nothing_when_no_ordered_offer_is_supported() {
-        let response = ProvisioningResponse::parse(
+        let response = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["map_e"],
@@ -1089,7 +1088,7 @@ mod tests {
 
     #[test]
     fn rejects_null_for_an_optional_response_field() {
-        let error = ProvisioningResponse::parse(
+        let error = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "token": null,
@@ -1098,15 +1097,12 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ProvisioningResponseError::NullField("token")
-        ));
+        assert!(matches!(error, ProvisioningDataError::NullField("token")));
     }
 
     #[test]
     fn rejects_non_object_method_payload() {
-        let error = ProvisioningResponse::parse(
+        let error = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["dslite"],
@@ -1117,7 +1113,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProvisioningResponseError::InvalidField {
+            ProvisioningDataError::InvalidField {
                 field: "dslite",
                 ..
             }
@@ -1126,7 +1122,7 @@ mod tests {
 
     #[test]
     fn rejects_an_ordered_capability_without_a_payload() {
-        let error = ProvisioningResponse::parse(
+        let error = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["dslite"]
@@ -1136,13 +1132,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProvisioningResponseError::MissingOffer(Capability::DsLite)
+            ProvisioningDataError::MissingOffer(Capability::DsLite)
         ));
     }
 
     #[test]
     fn validates_ttl_and_token_in_a_response() {
-        let ttl_error = ProvisioningResponse::parse(
+        let ttl_error = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "ttl": 604801,
@@ -1150,7 +1146,7 @@ mod tests {
             }"#,
         )
         .unwrap_err();
-        let token_error = ProvisioningResponse::parse(
+        let token_error = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "token": "not-a-token",
@@ -1159,8 +1155,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(ttl_error, ProvisioningResponseError::Ttl(_)));
-        assert!(matches!(token_error, ProvisioningResponseError::Token(_)));
+        assert!(matches!(ttl_error, ProvisioningDataError::Ttl(_)));
+        assert!(matches!(token_error, ProvisioningDataError::Token(_)));
     }
 
     #[test]

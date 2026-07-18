@@ -1,8 +1,8 @@
 use url::Url;
 
 use crate::{
-    Bootstrap, BootstrapError, ProvisioningRequest, ProvisioningResponse,
-    ProvisioningResponseError, ProvisioningUrlError, TlsPolicy,
+    Bootstrap, BootstrapError, ProvisioningData, ProvisioningDataError, ProvisioningRequest,
+    ProvisioningUrlError, TlsPolicy,
 };
 use std::{error::Error, future::Future, str::Utf8Error};
 
@@ -85,6 +85,52 @@ impl TransportResponse {
     pub fn body(&self) -> &[u8] {
         &self.body
     }
+}
+
+/// A successful HB46PP provisioning response and its HTTP cache metadata.
+#[derive(Debug)]
+pub struct ProvisioningResponse {
+    data: ProvisioningData,
+    cache_control: Option<String>,
+}
+
+impl ProvisioningResponse {
+    /// Returns the parsed HB46PP provisioning data.
+    pub fn data(&self) -> &ProvisioningData {
+        &self.data
+    }
+
+    /// Returns the `Cache-Control` header value from the successful response.
+    pub fn cache_control(&self) -> Option<&str> {
+        self.cache_control.as_deref()
+    }
+
+    /// Returns whether `Cache-Control` permits persistent storage.
+    ///
+    /// This returns `false` when the response contains the `no-store`
+    /// directive. It does not determine freshness or whether a stored response
+    /// can be reused without revalidation.
+    pub fn may_persist(&self) -> bool {
+        !self
+            .cache_control
+            .as_deref()
+            .is_some_and(cache_control_contains_no_store)
+    }
+}
+
+fn cache_control_contains_no_store(value: &str) -> bool {
+    for directive in value.split(',') {
+        let name = match directive.split_once('=') {
+            Some((name, _value)) => name,
+            None => directive,
+        };
+
+        if name.trim().eq_ignore_ascii_case("no-store") {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// The result of looking up the HB46PP bootstrap discovery record.
@@ -182,8 +228,8 @@ pub enum ClientError {
     #[error("server response is not a proper UTF-8 text")]
     ResponseEncoding(#[source] Utf8Error),
     /// The successful HTTP response body was not valid HB46PP provisioning data.
-    #[error("unable to parse provisioning response")]
-    ProvisioningResponse(#[source] ProvisioningResponseError),
+    #[error("unable to parse provisioning data")]
+    ProvisioningData(#[source] ProvisioningDataError),
     /// The server returned an invalid or disallowed redirect.
     #[error("failed to follow redirect")]
     Redirect(#[source] RedirectError),
@@ -283,10 +329,13 @@ where
                 200 => {
                     let body = std::str::from_utf8(response.body())
                         .map_err(ClientError::ResponseEncoding)?;
+                    let provisioning_data =
+                        ProvisioningData::parse(body).map_err(ClientError::ProvisioningData)?;
 
-                    return ProvisioningResponse::parse(body)
-                        .map(Some)
-                        .map_err(ClientError::ProvisioningResponse);
+                    return Ok(Some(ProvisioningResponse {
+                        data: provisioning_data,
+                        cache_control: response.cache_control,
+                    }));
                 }
                 307 => {
                     if redirects_count >= self.max_redirects {
@@ -418,7 +467,7 @@ mod tests {
             future::ready(Ok(TransportResponse::new(
                 200,
                 None,
-                None,
+                Some("max-age=3600, NO-STORE".to_string()),
                 br#"{
                     "enabler_name": "example",
                     "order": ["dslite"],
@@ -660,13 +709,16 @@ mod tests {
             .await
             .expect("provisioning should succeed")
             .expect("the bootstrap record should exist");
+        let data = response.data();
 
-        assert_eq!(response.provider_info().enabler_name(), "example");
-        assert_eq!(response.order(), [Capability::DsLite]);
+        assert_eq!(data.provider_info().enabler_name(), "example");
+        assert_eq!(data.order(), [Capability::DsLite]);
         assert_eq!(
-            response.offer(Capability::DsLite),
+            data.offer(Capability::DsLite),
             Some(&serde_json::json!({"aftr": "dslite.example"}))
         );
+        assert_eq!(response.cache_control(), Some("max-age=3600, NO-STORE"));
+        assert!(!response.may_persist());
     }
 
     #[tokio::test]
@@ -712,7 +764,7 @@ mod tests {
         let result = client.provision(&request).await;
 
         assert!(
-            matches!(result, Err(ClientError::ProvisioningResponse(_))),
+            matches!(result, Err(ClientError::ProvisioningData(_))),
             "result: {result:?}"
         );
     }
@@ -753,13 +805,15 @@ mod tests {
             .await
             .expect("provisioning should succeed")
             .expect("the bootstrap record should exist");
+        let data = response.data();
 
-        assert_eq!(response.provider_info().enabler_name(), "example");
-        assert_eq!(response.order(), [Capability::DsLite]);
+        assert_eq!(data.provider_info().enabler_name(), "example");
+        assert_eq!(data.order(), [Capability::DsLite]);
         assert_eq!(
-            response.offer(Capability::DsLite),
+            data.offer(Capability::DsLite),
             Some(&serde_json::json!({"aftr": "dslite.example"}))
         );
+        assert!(response.may_persist());
     }
 
     #[tokio::test]
