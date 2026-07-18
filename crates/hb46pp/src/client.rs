@@ -7,6 +7,7 @@ use crate::{
 use std::{error::Error, future::Future, str::Utf8Error};
 
 const DISCOVERY_NAME: &str = "4over6.info";
+const DEFAULT_MAX_REDIRECTS: usize = 5;
 
 /// An outbound HB46PP provisioning request for a transport to send.
 ///
@@ -130,10 +131,31 @@ pub trait Transport: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
     /// Sends one provisioning request.
-    fn send(
+    fn send_once(
         &self,
         request: TransportRequest,
     ) -> impl Future<Output = Result<TransportResponse, Self::Error>> + Send;
+}
+
+/// An error encountered while processing an HB46PP redirect response.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RedirectError {
+    /// The response did not include the target endpoint.
+    #[error("redirect response is missing the Location header")]
+    MissingLocation,
+    /// The target could not be resolved against the current endpoint.
+    #[error("invalid redirect Location header")]
+    InvalidLocation(#[source] url::ParseError),
+    /// The resolved target did not use HTTP or HTTPS.
+    #[error("unsupported redirect URL scheme: {0}")]
+    UnsupportedScheme(String),
+    /// An HTTP redirect would violate the bootstrap certificate policy.
+    #[error("certificate validation policy requires HTTPS redirects")]
+    RequiresHttps,
+    /// The response exceeded the client's redirect limit.
+    #[error("too many redirects")]
+    TooManyRedirects,
 }
 
 /// An error encountered while running the HB46PP client flow.
@@ -162,6 +184,9 @@ pub enum ClientError {
     /// The successful HTTP response body was not valid HB46PP provisioning data.
     #[error("unable to parse provisioning response")]
     ProvisioningResponse(#[source] ProvisioningResponseError),
+    /// The server returned an invalid or disallowed redirect.
+    #[error("failed to follow redirect")]
+    Redirect(#[source] RedirectError),
     /// The server returned an HTTP status not handled as an HB46PP response.
     #[error("server returned unexpected http response code: {0}")]
     UnexpectedResponseStatus(u16),
@@ -171,6 +196,7 @@ pub enum ClientError {
 pub struct Client<R, T> {
     resolver: R,
     transport: T,
+    max_redirects: usize,
 }
 
 impl<R, T> Client<R, T>
@@ -183,7 +209,17 @@ where
         Self {
             resolver,
             transport,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
         }
+    }
+
+    /// Sets the maximum number of redirects the client will follow.
+    ///
+    /// A value of zero rejects the first redirect. There is no value that
+    /// disables the redirect limit.
+    pub fn with_max_redirects(mut self, limit: usize) -> Self {
+        self.max_redirects = limit;
+        self
     }
 
     async fn discover_bootstrap(&self) -> Result<Option<Bootstrap>, ClientError> {
@@ -208,18 +244,15 @@ where
         }
     }
 
-    async fn send_initial_request(
+    async fn send_request(
         &self,
-        bootstrap: &Bootstrap,
-        request: &ProvisioningRequest,
+        endpoint: Url,
+        tls_policy: TlsPolicy,
     ) -> Result<TransportResponse, ClientError> {
-        let endpoint = bootstrap
-            .provisioning_url(request)
-            .map_err(ClientError::ProvisioningUrl)?;
+        let transport_request = TransportRequest::new(endpoint, tls_policy);
 
-        let transport_request = TransportRequest::new(endpoint, bootstrap.tls_policy());
         self.transport
-            .send(transport_request)
+            .send_once(transport_request)
             .await
             .map_err(|error| ClientError::Transport(Box::new(error)))
     }
@@ -236,20 +269,67 @@ where
             return Ok(None);
         };
 
-        let response = self.send_initial_request(&bootstrap, request).await?;
+        let mut request_url = bootstrap
+            .provisioning_url(request)
+            .map_err(ClientError::ProvisioningUrl)?;
 
-        match response.status() {
-            200 => {
-                let body =
-                    std::str::from_utf8(response.body()).map_err(ClientError::ResponseEncoding)?;
+        let mut redirects_count: usize = 0;
+        loop {
+            let response = self
+                .send_request(request_url.clone(), bootstrap.tls_policy())
+                .await?;
 
-                ProvisioningResponse::parse(body)
-                    .map(Some)
-                    .map_err(ClientError::ProvisioningResponse)
+            match response.status() {
+                200 => {
+                    let body = std::str::from_utf8(response.body())
+                        .map_err(ClientError::ResponseEncoding)?;
+
+                    return ProvisioningResponse::parse(body)
+                        .map(Some)
+                        .map_err(ClientError::ProvisioningResponse);
+                }
+                307 => {
+                    if redirects_count >= self.max_redirects {
+                        return Err(ClientError::Redirect(RedirectError::TooManyRedirects));
+                    }
+                    redirects_count += 1;
+                    let redirect_target = redirect_endpoint(
+                        &request_url,
+                        response.location(),
+                        bootstrap.tls_policy(),
+                    )
+                    .map_err(ClientError::Redirect)?;
+                    request_url = bootstrap
+                        .provisioning_url_for(redirect_target, request)
+                        .map_err(ClientError::ProvisioningUrl)?;
+                }
+                status => return Err(ClientError::UnexpectedResponseStatus(status)),
             }
-            status => Err(ClientError::UnexpectedResponseStatus(status)),
         }
     }
+}
+
+fn redirect_endpoint(
+    current_endpoint: &Url,
+    location: Option<&str>,
+    tls_policy: TlsPolicy,
+) -> Result<Url, RedirectError> {
+    let location = location.ok_or(RedirectError::MissingLocation)?;
+
+    let endpoint = current_endpoint
+        .join(location)
+        .map_err(RedirectError::InvalidLocation)?;
+
+    match endpoint.scheme() {
+        "https" => {}
+        "http" if tls_policy == TlsPolicy::ValidateCertificate => {
+            return Err(RedirectError::RequiresHttps);
+        }
+        "http" => {}
+        scheme => return Err(RedirectError::UnsupportedScheme(scheme.to_string())),
+    }
+
+    Ok(endpoint)
 }
 
 #[cfg(test)]
@@ -260,6 +340,7 @@ mod tests {
     use std::{
         convert::Infallible,
         future::{self, Future},
+        sync::Mutex,
     };
 
     struct NotFoundResolver;
@@ -307,7 +388,7 @@ mod tests {
     impl Transport for FakeTransport {
         type Error = Infallible;
 
-        fn send(
+        fn send_once(
             &self,
             _request: TransportRequest,
         ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
@@ -325,7 +406,7 @@ mod tests {
     impl Transport for SuccessfulTransport {
         type Error = Infallible;
 
-        fn send(
+        fn send_once(
             &self,
             request: TransportRequest,
         ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
@@ -356,7 +437,7 @@ mod tests {
     impl Transport for StaticResponseTransport {
         type Error = Infallible;
 
-        fn send(
+        fn send_once(
             &self,
             _request: TransportRequest,
         ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
@@ -374,12 +455,107 @@ mod tests {
     impl Transport for UnexpectedCallTransport {
         type Error = std::io::Error;
 
-        fn send(
+        fn send_once(
             &self,
             _request: TransportRequest,
         ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
             future::ready(Err(std::io::Error::other(
                 "transport was called unexpectedly",
+            )))
+        }
+    }
+
+    struct RedirectTransport {
+        call_count: Mutex<usize>,
+        location: &'static str,
+        expected_host: &'static str,
+        expected_path: &'static str,
+    }
+
+    impl RedirectTransport {
+        fn new(
+            location: &'static str,
+            expected_host: &'static str,
+            expected_path: &'static str,
+        ) -> Self {
+            Self {
+                call_count: Mutex::new(0),
+                location,
+                expected_host,
+                expected_path,
+            }
+        }
+    }
+
+    impl Transport for RedirectTransport {
+        type Error = Infallible;
+
+        fn send_once(
+            &self,
+            request: TransportRequest,
+        ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
+            let call = {
+                let mut call_count = self
+                    .call_count
+                    .lock()
+                    .expect("transport mutex should not be poisoned");
+                let call = *call_count;
+                *call_count += 1;
+                call
+            };
+
+            match call {
+                0 => {
+                    assert_eq!(request.endpoint().host_str(), Some("example.com"));
+
+                    future::ready(Ok(TransportResponse::new(
+                        307,
+                        Some(self.location.to_string()),
+                        None,
+                        Vec::new(),
+                    )))
+                }
+                1 => {
+                    assert_eq!(request.endpoint().host_str(), Some(self.expected_host));
+                    assert!(request.endpoint().query_pairs().any(|(key, value)| {
+                        key == "capability" && value == Capability::DsLite.as_str()
+                    }));
+                    assert_eq!(request.tls_policy(), TlsPolicy::ValidateCertificate);
+                    assert_eq!(request.endpoint().path(), self.expected_path);
+
+                    future::ready(Ok(TransportResponse::new(
+                        200,
+                        None,
+                        None,
+                        br#"{
+                    "enabler_name": "example",
+                    "order": ["dslite"],
+                    "dslite": {"aftr": "dslite.example"}
+                }"#
+                        .to_vec(),
+                    )))
+                }
+                _ => panic!("transport called more than twice"),
+            }
+        }
+    }
+
+    struct RedirectResponseTransport {
+        location: Option<&'static str>,
+    }
+
+    impl Transport for RedirectResponseTransport {
+        type Error = Infallible;
+
+        fn send_once(
+            &self,
+            _request: TransportRequest,
+        ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
+            future::ready(Ok(TransportResponse::new(
+                307,
+                self.location.map(str::to_string),
+                None,
+                Vec::new(),
             )))
         }
     }
@@ -556,6 +732,168 @@ mod tests {
 
         assert!(
             matches!(result, Err(ClientError::UnexpectedResponseStatus(500))),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_provision_follows_redirect() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectTransport::new(
+                "https://redirect.example/provision",
+                "redirect.example",
+                "/provision",
+            ),
+        );
+        let request = valid_request();
+
+        let response = client
+            .provision(&request)
+            .await
+            .expect("provisioning should succeed")
+            .expect("the bootstrap record should exist");
+
+        assert_eq!(response.provider_info().enabler_name(), "example");
+        assert_eq!(response.order(), [Capability::DsLite]);
+        assert_eq!(
+            response.offer(Capability::DsLite),
+            Some(&serde_json::json!({"aftr": "dslite.example"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn client_provision_resolves_relative_redirect_location() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/api/provision t=b"]),
+            RedirectTransport::new("../next", "example.com", "/next"),
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(matches!(result, Ok(Some(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_redirect_without_location() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectResponseTransport { location: None },
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::MissingLocation))
+            ),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_invalid_redirect_location() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectResponseTransport {
+                location: Some("https://[invalid"),
+            },
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::InvalidLocation(_)))
+            ),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_redirect_with_unsupported_scheme() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectResponseTransport {
+                location: Some("ftp://redirect.example/provision"),
+            },
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::UnsupportedScheme(
+                    ref scheme
+                ))) if scheme == "ftp"
+            ),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_http_redirect_when_certificate_validation_is_required() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectResponseTransport {
+                location: Some("http://redirect.example/provision"),
+            },
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::RequiresHttps))
+            ),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_redirects_above_the_limit() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectResponseTransport {
+                location: Some("/provision"),
+            },
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::TooManyRedirects))
+            ),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_first_redirect_when_max_redirects_is_zero() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectTransport::new(
+                "https://redirect.example/provision",
+                "redirect.example",
+                "/provision",
+            ),
+        )
+        .with_max_redirects(0);
+        let request = valid_request();
+
+        let result = client.provision(&request).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::TooManyRedirects))
+            ),
             "result: {result:?}"
         );
     }

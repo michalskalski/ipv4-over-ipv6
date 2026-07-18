@@ -513,27 +513,40 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    pub fn new(
+    /// Creates credentials restricted to one validated HTTPS server.
+    ///
+    /// The credentials can only be added to a request when certificate
+    /// validation is enabled and the request URL host matches
+    /// `expected_server_name`.
+    pub fn for_server(
         user: String,
         password: String,
-        expected_server_name: Option<String>,
+        expected_server_name: String,
     ) -> Result<Self, CredentialsError> {
-        if !valid_credential_component(&user) {
-            return Err(CredentialsError::InvalidUser);
-        }
-        if !valid_credential_component(&password) {
-            return Err(CredentialsError::InvalidPassword);
-        }
+        validate_credentials(&user, &password)?;
 
-        let expected_server_name = expected_server_name
-            .map(|server_name| Host::parse(&server_name))
-            .transpose()
+        let expected_server_name = Host::parse(&expected_server_name)
             .map_err(|_| CredentialsError::InvalidExpectedServerName)?;
 
         Ok(Self {
             user,
             password,
-            expected_server_name,
+            expected_server_name: Some(expected_server_name),
+        })
+    }
+
+    /// Creates credentials that may be sent to any provisioning endpoint.
+    ///
+    /// HB46PP permits this when the user did not provide an expected server
+    /// name. This includes endpoints using HTTP, unvalidated HTTPS, and hosts
+    /// reached through redirects, so callers must choose this explicitly.
+    pub fn unrestricted(user: String, password: String) -> Result<Self, CredentialsError> {
+        validate_credentials(&user, &password)?;
+
+        Ok(Self {
+            user,
+            password,
+            expected_server_name: None,
         })
     }
 
@@ -554,6 +567,17 @@ impl fmt::Debug for Credentials {
             .field("expected_server_name", &self.expected_server_name)
             .finish()
     }
+}
+
+fn validate_credentials(user: &str, password: &str) -> Result<(), CredentialsError> {
+    if !valid_credential_component(user) {
+        return Err(CredentialsError::InvalidUser);
+    }
+    if !valid_credential_component(password) {
+        return Err(CredentialsError::InvalidPassword);
+    }
+
+    Ok(())
 }
 
 fn valid_credential_component(value: &str) -> bool {
@@ -602,8 +626,8 @@ pub enum ProvisioningUrlError {
     CredentialsRequireHttps,
     #[error("credentials with an expected server name require certificate validation")]
     CredentialsRequireCertificateValidation,
-    #[error("bootstrap URL host does not match the expected server name")]
-    UnexpectedBootstrapHost,
+    #[error("provisioning URL host does not match the expected server name")]
+    UnexpectedProvisioningHost,
 }
 
 #[derive(Clone)]
@@ -700,7 +724,6 @@ pub enum TlsPolicy {
 /// TXT record.
 pub struct Bootstrap {
     url: Url,
-    host: Host<String>,
     tls_policy: TlsPolicy,
 }
 
@@ -753,14 +776,9 @@ impl Bootstrap {
         if url.scheme() == "http" && tls_policy == TlsPolicy::ValidateCertificate {
             return Err(BootstrapError::InvalidTlsForHttp);
         }
+        url.host().ok_or(BootstrapError::MissingUrlHost)?;
 
-        let host = url.host().ok_or(BootstrapError::MissingUrlHost)?.to_owned();
-
-        Ok(Bootstrap {
-            url,
-            host,
-            tls_policy,
-        })
+        Ok(Bootstrap { url, tls_policy })
     }
 
     /// Builds the provisioning URL for the initial bootstrap endpoint.
@@ -771,7 +789,18 @@ impl Bootstrap {
         &self,
         request: &ProvisioningRequest,
     ) -> Result<Url, ProvisioningUrlError> {
-        let mut request_url = self.url.clone();
+        self.provisioning_url_for(self.url.clone(), request)
+    }
+
+    pub(crate) fn provisioning_url_for(
+        &self,
+        endpoint: Url,
+        request: &ProvisioningRequest,
+    ) -> Result<Url, ProvisioningUrlError> {
+        if let Some(credentials) = request.credentials() {
+            self.validate_credentials(&endpoint, credentials)?;
+        }
+        let mut request_url = endpoint;
         let capabilities = request
             .capabilities()
             .iter()
@@ -788,7 +817,6 @@ impl Bootstrap {
                 query.append_pair("token", token);
             }
             if let Some(credentials) = request.credentials() {
-                self.validate_credentials(credentials)?;
                 query.append_pair("user", credentials.user());
                 query.append_pair("pass", credentials.password());
             }
@@ -796,20 +824,25 @@ impl Bootstrap {
         Ok(request_url)
     }
 
-    fn validate_credentials(&self, credentials: &Credentials) -> Result<(), ProvisioningUrlError> {
+    fn validate_credentials(
+        &self,
+        endpoint: &Url,
+        credentials: &Credentials,
+    ) -> Result<(), ProvisioningUrlError> {
         let Some(expected_server_name) = &credentials.expected_server_name else {
             return Ok(());
         };
 
-        if self.url.scheme() != "https" {
+        if endpoint.scheme() != "https" {
             return Err(ProvisioningUrlError::CredentialsRequireHttps);
         }
         if self.tls_policy != TlsPolicy::ValidateCertificate {
             return Err(ProvisioningUrlError::CredentialsRequireCertificateValidation);
         }
 
-        if self.host != expected_server_name.clone() {
-            return Err(ProvisioningUrlError::UnexpectedBootstrapHost);
+        let endpoint_host = endpoint.host().map(|host| host.to_owned());
+        if endpoint_host.as_ref() != Some(expected_server_name) {
+            return Err(ProvisioningUrlError::UnexpectedProvisioningHost);
         }
 
         Ok(())
@@ -861,11 +894,11 @@ mod tests {
         "0_1_0".parse().unwrap()
     }
 
-    fn credentials(expected_server_name: Option<&str>) -> Credentials {
-        Credentials::new(
+    fn credentials_for_server(expected_server_name: &str) -> Credentials {
+        Credentials::for_server(
             "user".to_string(),
             "pass".to_string(),
-            expected_server_name.map(str::to_string),
+            expected_server_name.to_string(),
         )
         .unwrap()
     }
@@ -1195,13 +1228,13 @@ mod tests {
     #[test]
     fn rejects_invalid_credentials() {
         let invalid_user =
-            Credentials::new("user!".to_string(), "pass".to_string(), None).unwrap_err();
+            Credentials::unrestricted("user!".to_string(), "pass".to_string()).unwrap_err();
         let invalid_password =
-            Credentials::new("user".to_string(), "pass!".to_string(), None).unwrap_err();
-        let invalid_server_name = Credentials::new(
+            Credentials::unrestricted("user".to_string(), "pass!".to_string()).unwrap_err();
+        let invalid_server_name = Credentials::for_server(
             "user".to_string(),
             "pass".to_string(),
-            Some("[2001:db8::1".to_string()),
+            "[2001:db8::1".to_string(),
         )
         .unwrap_err();
 
@@ -1344,7 +1377,7 @@ mod tests {
             version(),
             vec![Capability::DsLite],
             None,
-            Some(credentials(None)),
+            Some(Credentials::unrestricted("user".to_string(), "pass".to_string()).unwrap()),
         )
         .unwrap();
 
@@ -1368,7 +1401,7 @@ mod tests {
             version(),
             vec![Capability::DsLite],
             None,
-            Some(credentials(Some("prod.v6mig.v6connect.net"))),
+            Some(credentials_for_server("prod.v6mig.v6connect.net")),
         )
         .unwrap();
 
@@ -1383,7 +1416,7 @@ mod tests {
             version(),
             vec![Capability::DsLite],
             None,
-            Some(credentials(Some("provision.example"))),
+            Some(credentials_for_server("provision.example")),
         )
         .unwrap();
         let http = Bootstrap::parse("v=v6mig-1 url=http://provision.example/rule.cgi t=a").unwrap();
@@ -1402,7 +1435,7 @@ mod tests {
         );
         assert_eq!(
             unexpected_host.provisioning_url(&request_with_expected_server),
-            Err(ProvisioningUrlError::UnexpectedBootstrapHost)
+            Err(ProvisioningUrlError::UnexpectedProvisioningHost)
         );
     }
 

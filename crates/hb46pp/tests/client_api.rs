@@ -25,7 +25,7 @@ struct FakeTransport;
 impl Transport for FakeTransport {
     type Error = Infallible;
 
-    fn send(
+    fn send_once(
         &self,
         _request: TransportRequest,
     ) -> impl Future<Output = Result<TransportResponse, Self::Error>> {
