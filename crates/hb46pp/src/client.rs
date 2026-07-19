@@ -383,7 +383,7 @@ fn redirect_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Capability, FirmwareVersion, Product, VendorId};
+    use crate::{Capability, Credentials, FirmwareVersion, Product, VendorId};
 
     use super::*;
     use std::{
@@ -826,6 +826,45 @@ mod tests {
         let result = client.provision(&valid_request()).await;
 
         assert!(matches!(result, Ok(Some(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_redirect_to_unexpected_credential_host() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectTransport::new(
+                "https://redirect.example/provision",
+                "redirect.example",
+                "/provision",
+            ),
+        );
+        let credentials = Credentials::for_server(
+            "user".to_string(),
+            "password".to_string(),
+            "example.com".to_string(),
+        )
+        .expect("credentials should be valid");
+        let request = ProvisioningRequest::new(
+            vendor_id(),
+            product(),
+            version(),
+            vec![Capability::DsLite],
+            None,
+            Some(credentials),
+        )
+        .expect("request should be valid");
+
+        let result = client.provision(&request).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::ProvisioningUrl(
+                    ProvisioningUrlError::UnexpectedProvisioningHost
+                ))
+            ),
+            "result: {result:?}"
+        );
     }
 
     #[tokio::test]
