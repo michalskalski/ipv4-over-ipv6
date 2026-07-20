@@ -6,6 +6,13 @@ description = "Client library for the HTTP-Based IPv4 over IPv6 Provisioning Pro
 license = "MPL-2.0"
 repository = "https://github.com/michalskalski/ipv4-over-ipv6"
 
+[features]
+default = ["default-client"]
+client = []
+default-resolver = ["client", "dep:hickory-resolver"]
+default-transport = ["client", "dep:reqwest", "dep:tokio"]
+default-client = ["default-resolver", "default-transport"]
+
 [dependencies]
 serde = "1"
 serde_json = "1"
@@ -13,9 +20,18 @@ thiserror = "2"
 url = "2.5.8"
 hickory-resolver = {
     version = "0.26",
+    optional = true,
     default-features = false,
     features = ["system-config", "tokio"],
 }
+reqwest = {
+    version = "0.13",
+    optional = true,
+    default-features = false,
+    features = ["rustls"],
+}
+
+tokio = { version = "1", optional = true, features = ["net"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

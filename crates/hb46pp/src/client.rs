@@ -1,17 +1,23 @@
-use hickory_resolver::{
-    net::NetError,
-    proto::rr::{RData, rdata::TXT},
-};
 use url::Url;
 
 use crate::{
     Bootstrap, BootstrapError, ProvisioningData, ProvisioningDataError, ProvisioningRequest,
     ProvisioningUrlError, TlsPolicy,
 };
-use std::{error::Error, future::Future, str::Utf8Error, string::FromUtf8Error};
+use std::{error::Error, future::Future, str::Utf8Error};
+
+#[cfg(feature = "default-resolver")]
+mod default_resolver;
+#[cfg(feature = "default-resolver")]
+pub use default_resolver::{DefaultDiscoveryError, DefaultDiscoveryResolver};
+
+#[cfg(feature = "default-transport")]
+mod default_transport;
+#[cfg(feature = "default-transport")]
+pub use default_transport::{DefaultTransport, DefaultTransportError};
 
 const DISCOVERY_NAME: &str = "4over6.info.";
-const DEFAULT_MAX_REDIRECTS: usize = 5;
+const DEFAULT_MAX_REDIRECTS: usize = 10;
 
 /// An outbound HB46PP provisioning request for a transport to send.
 ///
@@ -169,65 +175,6 @@ pub trait DiscoveryResolver: Send + Sync {
     ) -> impl Future<Output = Result<DiscoveryAnswer, Self::Error>> + Send;
 }
 
-/// Errors returned by [`DefaultDiscoveryResolver`].
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum DefaultDiscoveryError {
-    /// The DNS resolver could not complete the TXT lookup.
-    #[error("TXT lookup failed")]
-    Lookup(#[source] NetError),
-
-    /// A returned TXT resource record was not valid UTF-8.
-    #[error("TXT record is not a valid UTF-8")]
-    InvalidEncoding(#[source] FromUtf8Error),
-}
-
-/// An HB46PP discovery resolver backed by Hickory and Tokio.
-///
-/// The resolver reads the system DNS configuration but performs queries
-/// independently of libc and NSS.
-pub struct DefaultDiscoveryResolver {
-    inner: hickory_resolver::TokioResolver,
-}
-
-impl DefaultDiscoveryResolver {
-    /// Creates a resolver using the system DNS configuration.
-    pub fn new() -> Result<Self, DefaultDiscoveryError> {
-        let builder =
-            hickory_resolver::Resolver::builder_tokio().map_err(DefaultDiscoveryError::Lookup)?;
-
-        let inner = builder.build().map_err(DefaultDiscoveryError::Lookup)?;
-
-        Ok(Self { inner })
-    }
-}
-
-impl DiscoveryResolver for DefaultDiscoveryResolver {
-    type Error = DefaultDiscoveryError;
-
-    async fn lookup_txt(&self, name: &str) -> Result<DiscoveryAnswer, Self::Error> {
-        let lookup = match self.inner.txt_lookup(name).await {
-            Ok(lookup) => lookup,
-            Err(error) if error.is_no_records_found() => {
-                return Ok(DiscoveryAnswer::NotFound);
-            }
-            Err(error) => return Err(DefaultDiscoveryError::Lookup(error)),
-        };
-
-        let mut records = Vec::new();
-        for answer in lookup.answers() {
-            let RData::TXT(txt) = &answer.data else {
-                continue;
-            };
-
-            let record = decode_txt_record(txt).map_err(DefaultDiscoveryError::InvalidEncoding)?;
-
-            records.push(record);
-        }
-        Ok(DiscoveryAnswer::Records(records))
-    }
-}
-
 /// Sends HTTP provisioning requests for the HB46PP client.
 ///
 /// Implementations resolve the provisioning endpoint, connect over IPv6, and
@@ -265,6 +212,9 @@ pub enum RedirectError {
     /// The response exceeded the client's redirect limit.
     #[error("too many redirects")]
     TooManyRedirects,
+    /// The redirect target specified a literal IPv4 address.
+    #[error("redirect target cannot use an IPv4 address")]
+    Ipv4TargetNotAllowed,
 }
 
 /// An error encountered while running the HB46PP client flow.
@@ -441,11 +391,11 @@ fn redirect_endpoint(
         scheme => return Err(RedirectError::UnsupportedScheme(scheme.to_string())),
     }
 
-    Ok(endpoint)
-}
+    if matches!(endpoint.host(), Some(url::Host::Ipv4(_))) {
+        return Err(RedirectError::Ipv4TargetNotAllowed);
+    }
 
-fn decode_txt_record(txt: &TXT) -> Result<String, FromUtf8Error> {
-    String::from_utf8(txt.txt_data.concat())
+    Ok(endpoint)
 }
 
 #[cfg(test)]
@@ -1072,30 +1022,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_txt_record_joins_fragments() {
-        let txt = TXT::from_bytes(vec![
-            b"v=v6mig-1 url=https://",
-            b"example.com/provision t=b",
-        ]);
-
-        let result = decode_txt_record(&txt);
-
-        assert_eq!(
-            result.as_deref(),
-            Ok("v=v6mig-1 url=https://example.com/provision t=b")
-        );
-    }
-
-    #[test]
-    fn decode_txt_record_rejects_invalid_utf8() {
-        let txt = TXT::from_bytes(vec![&[0xff]]);
-
-        let result = decode_txt_record(&txt);
-
-        assert!(result.is_err());
-    }
-
     #[tokio::test]
     async fn discovery_queries_absolute_protocol_name() {
         let client = Client::new(DiscoveryNameResolver, FakeTransport);
@@ -1103,5 +1029,25 @@ mod tests {
         let result = client.discover_bootstrap().await;
 
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_redirect_to_ipv4_literal() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=b"]),
+            RedirectResponseTransport {
+                location: Some("https://192.0.2.1/provision"),
+            },
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Redirect(RedirectError::Ipv4TargetNotAllowed))
+            ),
+            "result: {result:?}"
+        );
     }
 }

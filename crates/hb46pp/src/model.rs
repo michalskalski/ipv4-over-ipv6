@@ -26,6 +26,8 @@ pub enum BootstrapError {
     MissingUrlHost,
     #[error("record contain data beyond spec fields, record: {0}")]
     InvalidRecord(String),
+    #[error("provisioning URL cannot use an IPv4 address")]
+    Ipv4EndpointNotAllowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -775,7 +777,12 @@ impl Bootstrap {
         if url.scheme() == "http" && tls_policy == TlsPolicy::ValidateCertificate {
             return Err(BootstrapError::InvalidTlsForHttp);
         }
-        url.host().ok_or(BootstrapError::MissingUrlHost)?;
+
+        match url.host() {
+            Some(Host::Ipv4(_)) => return Err(BootstrapError::Ipv4EndpointNotAllowed),
+            Some(_) => {}
+            None => return Err(BootstrapError::MissingUrlHost),
+        }
 
         Ok(Bootstrap { url, tls_policy })
     }
@@ -1476,5 +1483,12 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, BootstrapError::InvalidRecord(_)));
+    }
+
+    #[test]
+    fn rejects_ipv4_literal_provisioning_url() {
+        let error = Bootstrap::parse("v=v6mig-1 url=https://192.0.2.1/provision t=b").unwrap_err();
+
+        assert!(matches!(error, BootstrapError::Ipv4EndpointNotAllowed));
     }
 }

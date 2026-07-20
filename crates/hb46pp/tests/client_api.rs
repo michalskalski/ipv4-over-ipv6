@@ -1,8 +1,14 @@
+#![cfg(feature = "client")]
+
 use std::{
     convert::Infallible,
     future::{self, Future},
 };
 
+#[cfg(feature = "default-resolver")]
+use hb46pp::client::DefaultDiscoveryResolver;
+#[cfg(feature = "default-transport")]
+use hb46pp::client::DefaultTransport;
 use hb46pp::client::{
     Client, DiscoveryAnswer, DiscoveryResolver, Transport, TransportRequest, TransportResponse,
 };
@@ -55,4 +61,20 @@ fn downstream_crates_can_implement_discovery_resolver() {
 #[test]
 fn downstream_crates_can_construct_client() {
     let _client = Client::new(FakeResolver, FakeTransport);
+}
+
+#[cfg(feature = "default-resolver")]
+#[test]
+fn downstream_crates_can_use_the_default_resolver() {
+    fn accepts_resolver_type<R: DiscoveryResolver>() {}
+
+    accepts_resolver_type::<DefaultDiscoveryResolver>();
+}
+
+#[cfg(feature = "default-transport")]
+#[test]
+fn downstream_crates_can_use_the_default_transport() {
+    fn accepts_transport_type<T: Transport>() {}
+
+    accepts_transport_type::<DefaultTransport>();
 }
