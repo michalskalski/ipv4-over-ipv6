@@ -178,6 +178,44 @@ fn build_http_client(accept_invalid_certificates: bool) -> Result<reqwest::Clien
 mod tests {
     use super::super::cache_control_contains_no_store;
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    async fn spawn_http_server(response: &'static [u8]) -> (url::Url, JoinHandle<()>) {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 1024];
+                let bytes_read = stream.read(&mut buffer).await.unwrap();
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&buffer[..bytes_read]);
+
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            assert!(request.starts_with(b"GET /provision HTTP/1.1\r\n"));
+
+            stream.write_all(response).await.unwrap();
+        });
+
+        let endpoint = url::Url::parse(&format!("http://{address}/provision")).unwrap();
+
+        (endpoint, server)
+    }
 
     #[test]
     fn ipv6_addresses_removes_ipv4_addresses() {
@@ -280,5 +318,52 @@ mod tests {
             .unwrap();
 
         assert!(cache_control_contains_no_store(&result));
+    }
+
+    #[tokio::test]
+    async fn default_transport_reads_an_http_response_over_ipv6() {
+        let raw_response = b"HTTP/1.1 200 OK\r\n\
+  Content-Length: 12\r\n\
+  Location: /next\r\n\
+  Cache-Control: max-age=3600\r\n\
+  Cache-Control: no-store\r\n\
+  Connection: close\r\n\
+  \r\n\
+  {\"order\":[]}";
+
+        let (endpoint, server) = spawn_http_server(raw_response).await;
+        let transport = DefaultTransport::new().unwrap();
+        let request = TransportRequest::new(endpoint, TlsPolicy::NoCertificateValidation);
+
+        let result = transport.send_once(request).await;
+        server.await.unwrap();
+
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.location(), Some("/next"));
+        assert_eq!(response.cache_control(), Some("max-age=3600, no-store"));
+        assert_eq!(response.body(), br#"{"order":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn default_transport_does_not_follow_redirects() {
+        let raw_response = b"HTTP/1.1 307 Temporary Redirect\r\n\
+  Location: /next\r\n\
+  Content-Length: 0\r\n\
+  Connection: close\r\n\
+  \r\n";
+
+        let (endpoint, server) = spawn_http_server(raw_response).await;
+        let transport = DefaultTransport::new().unwrap();
+        let request = TransportRequest::new(endpoint, TlsPolicy::NoCertificateValidation);
+
+        let result = transport.send_once(request).await;
+        server.await.unwrap();
+
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), 307);
+        assert_eq!(response.location(), Some("/next"));
     }
 }
