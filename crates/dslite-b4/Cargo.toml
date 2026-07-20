@@ -6,6 +6,10 @@ description = "DS-Lite B4 (RFC 6333) client daemon for illumos and Linux"
 license = "MPL-2.0"
 repository = "https://github.com/michalskalski/ipv4-over-ipv6"
 
+[features]
+default = ["hb46pp"]
+hb46pp = ["dep:hb46pp", "dep:rand", "hb46pp/default-client"]
+
 [lib]
 name = "dslite_b4"
 
@@ -22,6 +26,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1.0.102"
 libc = "0.2.186"
+hb46pp = {
+    version = "0.1.0",
+    path = "../hb46pp",
+    optional = true,
+    default-features = false,
+}
+rand = { version = "0.10.2", optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.20.0"
 futures-util = "0.3.32"

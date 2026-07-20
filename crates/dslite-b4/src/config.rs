@@ -73,22 +73,16 @@ pub struct AftrConfig {
 pub enum DiscoveryMethod {
     #[default]
     None,
-    V6mig,
+    Hb46pp,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct DiscoveryConfig {
     #[serde(default)]
     pub method: DiscoveryMethod,
-    #[serde(
-        default = "default_discovery_vendorid",
-        deserialize_with = "deserialize_v6mig_vendorid"
-    )]
+    #[serde(default = "default_discovery_vendorid")]
     pub vendor_id: String,
-    #[serde(
-        default = "default_discovery_product",
-        deserialize_with = "deserialize_v6mig_product"
-    )]
+    #[serde(default = "default_discovery_product")]
     pub product: String,
 }
 
@@ -100,57 +94,6 @@ impl Default for DiscoveryConfig {
             product: default_discovery_product(),
         }
     }
-}
-
-fn deserialize_v6mig_vendorid<'de, D>(d: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(d)?;
-    let (oui, suffix) = match value.split_once('-') {
-        Some((oui, suffix)) => (oui, Some(suffix)),
-        None => (value.as_str(), None),
-    };
-
-    if oui.len() != 6 || !oui.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(serde::de::Error::custom(
-            "discovery.vendor_id must start with 6 ASCII hex digits",
-        ));
-    }
-
-    if let Some(suffix) = suffix
-        && (suffix.is_empty()
-            || suffix.len() > 24
-            || !suffix
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
-    {
-        return Err(serde::de::Error::custom(
-            "discovery.vendor_id suffix must be 1..24 ASCII letters, digits, or '_'",
-        ));
-    }
-
-    Ok(value)
-}
-
-fn deserialize_v6mig_product<'de, D>(d: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(d)?;
-
-    if value.is_empty()
-        || value.len() > 32
-        || !value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(serde::de::Error::custom(
-            "discovery.product must be 1..32 ASCII letters, digits, '_' or '-'",
-        ));
-    }
-
-    Ok(value)
 }
 
 #[derive(Deserialize, Debug)]

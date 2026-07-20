@@ -12,6 +12,8 @@ use hb46pp::client::DefaultTransport;
 use hb46pp::client::{
     Client, DiscoveryAnswer, DiscoveryResolver, Transport, TransportRequest, TransportResponse,
 };
+#[cfg(feature = "default-client")]
+use hb46pp::client::{DefaultClient, DefaultClientError};
 
 struct FakeResolver;
 
@@ -61,6 +63,14 @@ fn downstream_crates_can_implement_discovery_resolver() {
 #[test]
 fn downstream_crates_can_construct_client() {
     let _client = Client::new(FakeResolver, FakeTransport);
+}
+
+#[cfg(feature = "default-client")]
+#[test]
+fn downstream_crates_can_construct_the_default_client() {
+    let constructor: fn() -> Result<DefaultClient, DefaultClientError> = DefaultClient::try_new;
+
+    let _ = constructor;
 }
 
 #[cfg(feature = "default-resolver")]

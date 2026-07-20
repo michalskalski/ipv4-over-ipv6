@@ -258,6 +258,35 @@ pub struct Client<R, T> {
     max_redirects: usize,
 }
 
+/// An HB46PP client using the default DNS resolver and HTTP transport.
+#[cfg(feature = "default-client")]
+pub type DefaultClient = Client<DefaultDiscoveryResolver, DefaultTransport>;
+
+/// Errors returned while constructing a [`DefaultClient`].
+#[cfg(feature = "default-client")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DefaultClientError {
+    /// The system DNS configuration could not initialize the resolver.
+    #[error("failed to create the default discovery resolver")]
+    Resolver(#[from] DefaultDiscoveryError),
+
+    /// Reqwest could not initialize the HTTP transport.
+    #[error("failed to create the default HTTP transport")]
+    Transport(#[from] reqwest::Error),
+}
+
+#[cfg(feature = "default-client")]
+impl Client<DefaultDiscoveryResolver, DefaultTransport> {
+    /// Creates a client using the default DNS resolver and HTTP transport.
+    pub fn try_new() -> Result<Self, DefaultClientError> {
+        let resolver = DefaultDiscoveryResolver::new()?;
+        let transport = DefaultTransport::new()?;
+
+        Ok(Self::new(resolver, transport))
+    }
+}
+
 impl<R, T> Client<R, T>
 where
     R: DiscoveryResolver,

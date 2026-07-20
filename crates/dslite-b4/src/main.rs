@@ -6,6 +6,7 @@ use dslite_b4::tunnel::illumos::IllumosBackend;
 use dslite_b4::tunnel::linux::LinuxBackend;
 use dslite_b4::{
     aftr::AftrSelector,
+    aftr_discovery::DiscoveryRuntime,
     config::{AftrAddress, Config},
     dns::resolve_aftr_addresses,
     lifecycle::{Desired, reconcile_once},
@@ -51,9 +52,12 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config(&cli.config)?;
     match cli.command.unwrap_or(Commands::Run) {
         Commands::CheckConfig => {
+            DiscoveryRuntime::validate_config(&config.discovery)?;
+
             tracing::info!(?config);
         }
         Commands::Run => {
+            let discovery = DiscoveryRuntime::from_config(&config.discovery)?;
             let _pid = PidFile::create(&config.runtime.state_dir)?;
 
             #[cfg(target_os = "linux")]
@@ -61,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(target_os = "illumos")]
             let backend = IllumosBackend::new(config.tunnel.name.clone())?;
 
-            run(backend, &config).await?
+            run(backend, &config, discovery).await?
         }
         Commands::SetAftr { addr } => {
             write_provided_aftr(&config.runtime.state_dir, &addr)?;
@@ -75,7 +79,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()> {
+async fn run<B: TunnelBackend>(
+    backend: B,
+    config: &Config,
+    mut discovery: DiscoveryRuntime,
+) -> anyhow::Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
     let mut sigusr1 = signal::unix::signal(signal::unix::SignalKind::user_defined1())?;
     let mut network_changes = NetworkChanges::new()?;
@@ -84,7 +92,8 @@ async fn run<B: TunnelBackend>(backend: B, config: &Config) -> anyhow::Result<()
     loop {
         let observed = backend.observe().await?;
         let current_aftr = current_aftr(&observed);
-        let desired = compute_desired(config, &mut aftr_selector, current_aftr).await?;
+        let desired =
+            compute_desired(config, &mut discovery, &mut aftr_selector, current_aftr).await?;
         let action = reconcile_once(&backend, &observed, &desired).await?;
         tracing::info!(?action, "reconciliation completed");
 
@@ -125,15 +134,35 @@ fn current_aftr(observed: &Observed) -> Option<std::net::Ipv6Addr> {
 
 async fn compute_desired(
     config: &Config,
+    discovery: &mut DiscoveryRuntime,
     aftr_selector: &mut AftrSelector,
     current_aftr: Option<std::net::Ipv6Addr>,
 ) -> anyhow::Result<Desired> {
-    let Some(aftr) = effective_aftr(config)? else {
+    let aftr = match effective_aftr(config)? {
+        Some(aftr) => Some(aftr),
+
+        None => {
+            tracing::debug!("no static or externally provided AFTR, trying automatic discovery");
+            match discovery.discover_aftr().await {
+                Ok(aftr) => aftr,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error, "automatic AFTR discovery unavailable"
+                    );
+                    return Ok(Desired::Unavailable);
+                }
+            }
+        }
+    };
+    let Some(aftr) = aftr else {
         tracing::debug!("no AFTR source available");
         return Ok(Desired::Unavailable);
     };
     let aftr_candidates = match resolve_aftr_addresses(&aftr).await {
-        Ok(addrs) => addrs,
+        Ok(addrs) => {
+            tracing::debug!(aftr = ?aftr, candidates = ?addrs, "AFTR addresses resolved");
+            addrs
+        }
         Err(e) => {
             tracing::warn!(error = %e, "AFTR resolution unavailable");
             return Ok(Desired::Unavailable);
@@ -142,12 +171,24 @@ async fn compute_desired(
     let grace = Duration::from_secs(config.health.aftr_missing_grace_secs);
     let Some(aftr_ip) = aftr_selector.select(&aftr_candidates, current_aftr, grace, Instant::now())
     else {
+        tracing::debug!("no AFTR address selected from resolved candidates");
         return Ok(Desired::Unavailable);
     };
+    tracing::debug!(remote_v6 = %aftr_ip, "AFTR address selected");
     let local_v6 = match config.tunnel.local_v6 {
-        Some(addr) => addr,
+        Some(addr) => {
+            tracing::debug!(local_v6 = %addr, source = "config", "local IPv6 address selected");
+            addr
+        }
         None => match dslite_b4::discovery::discover_local_v6(aftr_ip) {
-            Ok(addr) => addr,
+            Ok(addr) => {
+                tracing::debug!(
+                    local_v6 = %addr,
+                    source = "kernel-route",
+                    "local IPv6 address selected"
+                );
+                addr
+            }
             Err(e) if e.is_transient() => {
                 tracing::warn!(error = %e, "discover local IPv6 addr failed");
                 return Ok(Desired::Unavailable);
@@ -164,9 +205,21 @@ async fn compute_desired(
 
 fn effective_aftr(config: &Config) -> anyhow::Result<Option<AftrAddress>> {
     if let Some(address) = &config.aftr.address {
+        tracing::debug!(source = "config", aftr = ?address, "AFTR source selected");
         return Ok(Some(address.clone()));
     }
-    runtime_state::read_provided_aftr(&config.runtime.state_dir)
+
+    let provided = runtime_state::read_provided_aftr(&config.runtime.state_dir)?;
+    if let Some(address) = &provided {
+        tracing::debug!(
+            source = "provided",
+            aftr = ?address,
+            state_dir = %config.runtime.state_dir.display(),
+            "AFTR source selected"
+        );
+    }
+
+    Ok(provided)
 }
 
 fn load_config(path: &Path) -> anyhow::Result<Config> {

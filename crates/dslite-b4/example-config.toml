@@ -1,5 +1,5 @@
 [runtime]
-# pidfile, provided AFTR, v6mig cache, and status snapshot
+# pidfile, provided AFTR, HB46PP cache, and status snapshot
 state_dir = "/var/run/dslite-b4"
 
 [tunnel]
