@@ -6,6 +6,8 @@ description = "Client library for the HTTP-Based IPv4 over IPv6 Provisioning Pro
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/michalskalski/ipv4-over-ipv6"
 readme = "README.md"
+keywords = ["hb46pp", "ipv6", "ipv4-over-ipv6"]
+categories = ["network-programming"]
 
 [features]
 default = ["default-client"]
