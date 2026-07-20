@@ -3,8 +3,9 @@ name = "hb46pp"
 version = "0.1.0"
 edition = "2024"
 description = "Client library for the HTTP-Based IPv4 over IPv6 Provisioning Protocol"
-license = "MPL-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/michalskalski/ipv4-over-ipv6"
+readme = "README.md"
 
 [features]
 default = ["default-client"]

@@ -8,11 +8,6 @@ use anyhow::Context;
 use crate::config::{AftrAddress, DiscoveryConfig, DiscoveryMethod};
 
 #[cfg(feature = "hb46pp")]
-const DEFAULT_REFRESH_MIN_SECS: u64 = 20 * 60 * 60;
-#[cfg(feature = "hb46pp")]
-const DEFAULT_REFRESH_MAX_SECS: u64 = 24 * 60 * 60;
-
-#[cfg(feature = "hb46pp")]
 #[derive(Debug)]
 struct ActiveProvisioning {
     aftr: Option<AftrAddress>,
@@ -41,6 +36,90 @@ struct Hb46ppRuntime {
     request: hb46pp::ProvisioningRequest,
     client: hb46pp::client::DefaultClient,
     active: Option<ActiveProvisioning>,
+}
+
+#[cfg(feature = "hb46pp")]
+impl Hb46ppRuntime {
+    async fn discover_aftr(&mut self) -> anyhow::Result<Option<AftrAddress>> {
+        let now = Instant::now();
+        if let Some(cached) = self.active.as_ref()
+            && cached.is_fresh(now)
+        {
+            tracing::debug!(
+                refresh_in_secs = cached.refresh_at.duration_since(now).as_secs(),
+                aftr = ?cached.aftr,
+                "reusing active HB46PP provisioning result"
+            );
+            return Ok(cached.aftr.clone());
+        }
+
+        tracing::debug!("starting HB46PP provisioning attempt");
+        let outcome = self
+            .client
+            .provision(&self.request)
+            .await
+            .context("HB46PP provisioning failed")?;
+        let next_attempt_after = choose_next_attempt_delay(outcome.next_attempt_window());
+
+        match outcome {
+            hb46pp::client::ProvisioningOutcome::Provisioned(response) => {
+                self.apply_response(response, next_attempt_after)
+            }
+            hb46pp::client::ProvisioningOutcome::NotFound => {
+                tracing::debug!(
+                    next_attempt_after_secs = next_attempt_after.as_secs(),
+                    "HB46PP bootstrap record not found"
+                );
+
+                // Retain negative discovery so network-change hints do not bypass
+                // the protocol retry window.
+                self.store_active(None, next_attempt_after);
+                Ok(None)
+            }
+        }
+    }
+
+    fn apply_response(
+        &mut self,
+        response: hb46pp::client::ProvisioningResponse,
+        next_attempt_after: Duration,
+    ) -> anyhow::Result<Option<AftrAddress>> {
+        tracing::debug!(
+            ttl_secs = ?response.data().ttl().map(|ttl| ttl.as_secs()),
+            cache_control = ?response.cache_control(),
+            may_persist = response.may_persist(),
+            "HB46PP provisioning response received"
+        );
+
+        let aftr = crate::hb46pp::dslite_aftr(response.data())
+            .context("invalid DS-Lite provisioning offer")?;
+
+        match &aftr {
+            Some(address) => tracing::debug!(
+                source = "hb46pp",
+                aftr = ?address,
+                "AFTR source selected"
+            ),
+            None => tracing::debug!("HB46PP response has no active DS-Lite offer"),
+        }
+
+        tracing::debug!(
+            refresh_after_secs = next_attempt_after.as_secs(),
+            "HB46PP provisioning result retained in memory"
+        );
+
+        // Cache-Control no-store prohibits persistence, not retaining the
+        // active provisioning state in memory.
+        self.store_active(aftr.clone(), next_attempt_after);
+        Ok(aftr)
+    }
+
+    fn store_active(&mut self, aftr: Option<AftrAddress>, refresh_after: Duration) {
+        self.active = Some(ActiveProvisioning {
+            aftr,
+            refresh_at: Instant::now() + refresh_after,
+        });
+    }
 }
 
 impl fmt::Debug for DiscoveryRuntime {
@@ -119,76 +198,14 @@ impl DiscoveryRuntime {
                 Ok(None)
             }
             #[cfg(feature = "hb46pp")]
-            DiscoveryRuntimeKind::Hb46pp(runtime) => {
-                let Hb46ppRuntime {
-                    request,
-                    client,
-                    active,
-                } = runtime.as_mut();
-                let now = Instant::now();
-                if let Some(active) = active
-                    && active.is_fresh(now)
-                {
-                    tracing::debug!(
-                        refresh_in_secs = active.refresh_at.duration_since(now).as_secs(),
-                        aftr = ?active.aftr,
-                        "reusing active HB46PP provisioning result"
-                    );
-                    return Ok(active.aftr.clone());
-                }
-
-                tracing::debug!("starting HB46PP provisioning attempt");
-                let Some(response) = client
-                    .provision(request)
-                    .await
-                    .context("HB46PP provisioning failed")?
-                else {
-                    tracing::debug!("HB46PP bootstrap record not found");
-                    return Ok(None);
-                };
-
-                tracing::debug!(
-                    ttl_secs = ?response.data().ttl().map(|ttl| ttl.as_secs()),
-                    cache_control = ?response.cache_control(),
-                    may_persist = response.may_persist(),
-                    "HB46PP provisioning response received"
-                );
-
-                let aftr = crate::hb46pp::dslite_aftr(response.data())
-                    .context("invalid DS-Lite provisioning offer")?;
-                let refresh_after = refresh_after(response.data().ttl());
-                let refresh_at = Instant::now() + refresh_after;
-
-                match &aftr {
-                    Some(address) => tracing::debug!(
-                        source = "hb46pp",
-                        aftr = ?address,
-                        "AFTR source selected"
-                    ),
-                    None => tracing::debug!("HB46PP response has no active DS-Lite offer"),
-                }
-
-                tracing::debug!(
-                    refresh_after_secs = refresh_after.as_secs(),
-                    "HB46PP provisioning result retained in memory"
-                );
-                *active = Some(ActiveProvisioning {
-                    aftr: aftr.clone(),
-                    refresh_at,
-                });
-
-                Ok(aftr)
-            }
+            DiscoveryRuntimeKind::Hb46pp(runtime) => runtime.discover_aftr().await,
         }
     }
 }
 
 #[cfg(feature = "hb46pp")]
-fn refresh_after(ttl: Option<hb46pp::Ttl>) -> Duration {
-    let seconds = ttl.map_or_else(
-        || rand::random_range(DEFAULT_REFRESH_MIN_SECS..=DEFAULT_REFRESH_MAX_SECS),
-        |ttl| u64::from(ttl.as_secs()),
-    );
+fn choose_next_attempt_delay(window: hb46pp::client::NextAttemptWindow) -> Duration {
+    let seconds = rand::random_range(window.min().as_secs()..=window.max().as_secs());
 
     Duration::from_secs(seconds)
 }
@@ -226,22 +243,13 @@ mod tests {
 
     #[cfg(feature = "hb46pp")]
     #[test]
-    fn uses_response_ttl_as_refresh_delay() {
-        let ttl = hb46pp::Ttl::try_from(61_200).unwrap();
-
-        assert_eq!(refresh_after(Some(ttl)), Duration::from_secs(61_200));
-    }
-
-    #[cfg(feature = "hb46pp")]
-    #[test]
-    fn chooses_specified_refresh_window_without_ttl() {
-        let refresh_after = refresh_after(None);
+    fn chooses_delay_within_next_attempt_window() {
+        let window = hb46pp::client::ProvisioningOutcome::NotFound.next_attempt_window();
+        let delay = choose_next_attempt_delay(window);
 
         assert!(
-            (Duration::from_secs(DEFAULT_REFRESH_MIN_SECS)
-                ..=Duration::from_secs(DEFAULT_REFRESH_MAX_SECS))
-                .contains(&refresh_after),
-            "refresh_after: {refresh_after:?}"
+            (window.min()..=window.max()).contains(&delay),
+            "delay: {delay:?}"
         );
     }
 

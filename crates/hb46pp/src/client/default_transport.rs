@@ -21,6 +21,7 @@ pub enum DefaultTransportError {
     InvalidHeader {
         /// The name of the invalid response header.
         header: String,
+        /// The error returned while converting the header value to text.
         #[source]
         source: reqwest::header::ToStrError,
     },
@@ -28,7 +29,7 @@ pub enum DefaultTransportError {
     /// The response body exceeded the maximum size accepted by the transport.
     #[error("response body exceeds the maximum accepted size of {limit} bytes")]
     ResponseBodyTooLarge {
-        /// The maximum accepted response-body size in bytes.
+        /// The maximum accepted size of the response body, in bytes.
         limit: usize,
     },
 

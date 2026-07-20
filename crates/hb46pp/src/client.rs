@@ -4,7 +4,7 @@ use crate::{
     Bootstrap, BootstrapError, ProvisioningData, ProvisioningDataError, ProvisioningRequest,
     ProvisioningUrlError, TlsPolicy,
 };
-use std::{error::Error, future::Future, str::Utf8Error};
+use std::{error::Error, future::Future, str::Utf8Error, time::Duration};
 
 #[cfg(feature = "default-resolver")]
 mod default_resolver;
@@ -18,6 +18,41 @@ pub use default_transport::{DefaultTransport, DefaultTransportError};
 
 const DISCOVERY_NAME: &str = "4over6.info.";
 const DEFAULT_MAX_REDIRECTS: usize = 10;
+const DISCOVERY_NOT_FOUND_MIN: Duration = Duration::from_secs(60 * 60);
+const DISCOVERY_NOT_FOUND_MAX: Duration = Duration::from_secs(3 * 60 * 60);
+const DISCOVERY_FAILURE_MIN: Duration = Duration::from_secs(60);
+const DISCOVERY_FAILURE_MAX: Duration = Duration::from_secs(10 * 60);
+const PROVISIONING_FAILURE_MIN: Duration = Duration::from_secs(10 * 60);
+const PROVISIONING_FAILURE_MAX: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_REFRESH_MIN: Duration = Duration::from_secs(20 * 60 * 60);
+const DEFAULT_REFRESH_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The interval in which HB46PP recommends making another provisioning attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NextAttemptWindow {
+    min: Duration,
+    max: Duration,
+}
+
+impl NextAttemptWindow {
+    fn new(min: Duration, max: Duration) -> Self {
+        Self { min, max }
+    }
+
+    fn exact(delay: Duration) -> Self {
+        Self::new(delay, delay)
+    }
+
+    /// Returns the earliest recommended delay before the next attempt.
+    pub fn min(&self) -> Duration {
+        self.min
+    }
+
+    /// Returns the latest recommended delay before the next attempt.
+    pub fn max(&self) -> Duration {
+        self.max
+    }
+}
 
 /// An outbound HB46PP provisioning request for a transport to send.
 ///
@@ -43,7 +78,7 @@ impl TransportRequest {
         &self.endpoint
     }
 
-    /// Returns the certificate-validation policy from the bootstrap record.
+    /// Returns the certificate validation policy from the bootstrap record.
     pub fn tls_policy(&self) -> TlsPolicy {
         self.tls_policy
     }
@@ -126,6 +161,38 @@ impl ProvisioningResponse {
             .as_deref()
             .is_some_and(cache_control_contains_no_store)
     }
+
+    /// Returns when the response should be refreshed.
+    ///
+    /// A response TTL produces an exact delay. When the response omits its
+    /// TTL, HB46PP specifies a randomized delay between 20 and 24 hours.
+    pub fn next_attempt_window(&self) -> NextAttemptWindow {
+        match self.data.ttl() {
+            Some(ttl) => NextAttemptWindow::exact(Duration::from_secs(u64::from(ttl.as_secs()))),
+            None => NextAttemptWindow::new(DEFAULT_REFRESH_MIN, DEFAULT_REFRESH_MAX),
+        }
+    }
+}
+
+/// The outcome of a completed HB46PP provisioning attempt.
+#[derive(Debug)]
+pub enum ProvisioningOutcome {
+    /// A bootstrap record was found and provisioning data was received.
+    Provisioned(ProvisioningResponse),
+    /// DNS returned NXDOMAIN or NODATA for the bootstrap discovery name.
+    NotFound,
+}
+
+impl ProvisioningOutcome {
+    /// Returns the interval in which HB46PP recommends another attempt.
+    pub fn next_attempt_window(&self) -> NextAttemptWindow {
+        match self {
+            Self::Provisioned(response) => response.next_attempt_window(),
+            Self::NotFound => {
+                NextAttemptWindow::new(DISCOVERY_NOT_FOUND_MIN, DISCOVERY_NOT_FOUND_MAX)
+            }
+        }
+    }
 }
 
 fn cache_control_contains_no_store(value: &str) -> bool {
@@ -148,8 +215,8 @@ fn cache_control_contains_no_store(value: &str) -> bool {
 pub enum DiscoveryAnswer {
     /// Complete TXT resource records.
     ///
-    /// Each string represents one resource record after its DNS character-string
-    /// fragments have been joined in wire order.
+    /// Each string represents one resource record after its DNS fragments have
+    /// been joined in wire order.
     Records(Vec<String>),
     /// No bootstrap record exists because the lookup returned NXDOMAIN or NODATA.
     NotFound,
@@ -160,15 +227,15 @@ pub enum DiscoveryAnswer {
 /// This trait is limited to the protocol's discovery record. Resolving the
 /// provisioning endpoint hostname remains the transport's responsibility.
 pub trait DiscoveryResolver: Send + Sync {
-    /// The resolver-specific error returned when a TXT lookup fails.
+    /// The error returned by the resolver when a TXT lookup fails.
     type Error: Error + Send + Sync + 'static;
 
     /// Looks up the TXT records for an HB46PP discovery name.
     ///
     /// Implementations must return [`DiscoveryAnswer::NotFound`] for NXDOMAIN
     /// and NODATA. Other resolver failures must be returned as `Err`.
-    /// Character-string fragments belonging to one TXT resource record must
-    /// be joined before returning [`DiscoveryAnswer::Records`].
+    /// Fragments belonging to one TXT resource record must be joined before
+    /// returning [`DiscoveryAnswer::Records`].
     fn lookup_txt(
         &self,
         name: &str,
@@ -183,7 +250,7 @@ pub trait DiscoveryResolver: Send + Sync {
 /// rules as those remain the client's responsibility. Implementations must not
 /// follow redirects automatically.
 pub trait Transport: Send + Sync {
-    /// The transport-specific error returned when sending a request fails.
+    /// The error returned by the transport when sending a request fails.
     type Error: Error + Send + Sync + 'static;
 
     /// Sends one provisioning request.
@@ -251,7 +318,33 @@ pub enum ClientError {
     UnexpectedResponseStatus(u16),
 }
 
-/// An HB46PP provisioning client using caller-provided network adapters.
+impl ClientError {
+    /// Returns the interval in which HB46PP recommends retrying this failure.
+    ///
+    /// `None` means HB46PP does not prescribe a retry window for the failure.
+    pub fn next_attempt_window(&self) -> Option<NextAttemptWindow> {
+        match self {
+            Self::Resolver(_) => Some(NextAttemptWindow::new(
+                DISCOVERY_FAILURE_MIN,
+                DISCOVERY_FAILURE_MAX,
+            )),
+            Self::UnexpectedRecordCount(_) | Self::Bootstrap(_) => Some(NextAttemptWindow::new(
+                DISCOVERY_NOT_FOUND_MIN,
+                DISCOVERY_NOT_FOUND_MAX,
+            )),
+            Self::Transport(_)
+            | Self::ResponseEncoding(_)
+            | Self::ProvisioningData(_)
+            | Self::UnexpectedResponseStatus(_) => Some(NextAttemptWindow::new(
+                PROVISIONING_FAILURE_MIN,
+                PROVISIONING_FAILURE_MAX,
+            )),
+            Self::ProvisioningUrl(_) | Self::Redirect(_) => None,
+        }
+    }
+}
+
+/// An HB46PP provisioning client using network adapters provided by the caller.
 pub struct Client<R, T> {
     resolver: R,
     transport: T,
@@ -347,14 +440,15 @@ where
 
     /// Discovers and requests HB46PP provisioning data.
     ///
-    /// Returns `Ok(None)` when the discovery name has no TXT record. A valid
-    /// provisioning response is parsed and returned as `Ok(Some(_))`.
+    /// Returns [`ProvisioningOutcome::NotFound`] when the discovery name has
+    /// no TXT record. A valid provisioning response is parsed and returned as
+    /// [`ProvisioningOutcome::Provisioned`].
     pub async fn provision(
         &self,
         request: &ProvisioningRequest,
-    ) -> Result<Option<ProvisioningResponse>, ClientError> {
+    ) -> Result<ProvisioningOutcome, ClientError> {
         let Some(bootstrap) = self.discover_bootstrap().await? else {
-            return Ok(None);
+            return Ok(ProvisioningOutcome::NotFound);
         };
 
         let mut request_url = bootstrap
@@ -374,7 +468,7 @@ where
                     let provisioning_data =
                         ProvisioningData::parse(body).map_err(ClientError::ProvisioningData)?;
 
-                    return Ok(Some(ProvisioningResponse {
+                    return Ok(ProvisioningOutcome::Provisioned(ProvisioningResponse {
                         data: provisioning_data,
                         cache_control: response.cache_control,
                     }));
@@ -756,6 +850,87 @@ mod tests {
         .unwrap()
     }
 
+    fn expect_provisioned(outcome: ProvisioningOutcome) -> ProvisioningResponse {
+        match outcome {
+            ProvisioningOutcome::Provisioned(response) => response,
+            ProvisioningOutcome::NotFound => panic!("the bootstrap record should exist"),
+        }
+    }
+
+    fn response_with_ttl(ttl: Option<u64>) -> ProvisioningResponse {
+        let ttl = ttl.map_or_else(String::new, |ttl| format!(r#""ttl": {ttl},"#));
+        let data = ProvisioningData::parse(&format!(
+            r#"{{
+                "enabler_name": "example",
+                {ttl}
+                "order": []
+            }}"#
+        ))
+        .unwrap();
+
+        ProvisioningResponse {
+            data,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn response_ttl_produces_exact_next_attempt_window() {
+        let response = response_with_ttl(Some(61_200));
+        let window = response.next_attempt_window();
+
+        assert_eq!(window.min(), Duration::from_secs(61_200));
+        assert_eq!(window.max(), Duration::from_secs(61_200));
+    }
+
+    #[test]
+    fn response_without_ttl_uses_default_refresh_window() {
+        let response = response_with_ttl(None);
+        let window = response.next_attempt_window();
+
+        assert_eq!(window.min(), Duration::from_secs(20 * 60 * 60));
+        assert_eq!(window.max(), Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn not_found_uses_discovery_retry_window() {
+        let window = ProvisioningOutcome::NotFound.next_attempt_window();
+
+        assert_eq!(window.min(), Duration::from_secs(60 * 60));
+        assert_eq!(window.max(), Duration::from_secs(3 * 60 * 60));
+    }
+
+    #[test]
+    fn client_errors_only_expose_specified_retry_windows() {
+        let resolver = ClientError::Resolver(Box::new(std::io::Error::other("failed")));
+        let malformed_discovery = ClientError::UnexpectedRecordCount(2);
+        let provisioning = ClientError::UnexpectedResponseStatus(500);
+        let unspecified = ClientError::Redirect(RedirectError::MissingLocation);
+
+        assert_eq!(
+            resolver.next_attempt_window(),
+            Some(NextAttemptWindow::new(
+                Duration::from_secs(60),
+                Duration::from_secs(10 * 60)
+            ))
+        );
+        assert_eq!(
+            malformed_discovery.next_attempt_window(),
+            Some(NextAttemptWindow::new(
+                Duration::from_secs(60 * 60),
+                Duration::from_secs(3 * 60 * 60)
+            ))
+        );
+        assert_eq!(
+            provisioning.next_attempt_window(),
+            Some(NextAttemptWindow::new(
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(30 * 60)
+            ))
+        );
+        assert_eq!(unspecified.next_attempt_window(), None);
+    }
+
     #[tokio::test]
     async fn client_provision_good_path() {
         let client = Client::new(
@@ -764,11 +939,11 @@ mod tests {
         );
         let request = valid_request();
 
-        let response = client
+        let outcome = client
             .provision(&request)
             .await
-            .expect("provisioning should succeed")
-            .expect("the bootstrap record should exist");
+            .expect("provisioning should succeed");
+        let response = expect_provisioned(outcome);
         let data = response.data();
 
         assert_eq!(data.provider_info().enabler_name(), "example");
@@ -782,13 +957,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_returns_none_without_a_discovery_record() {
+    async fn provision_returns_not_found_without_a_discovery_record() {
         let client = Client::new(NotFoundResolver, UnexpectedCallTransport);
         let request = valid_request();
 
         let result = client.provision(&request).await;
 
-        assert!(matches!(result, Ok(None)), "result: {result:?}");
+        assert!(matches!(result, Ok(ProvisioningOutcome::NotFound)));
     }
 
     #[tokio::test]
@@ -860,11 +1035,11 @@ mod tests {
         );
         let request = valid_request();
 
-        let response = client
+        let outcome = client
             .provision(&request)
             .await
-            .expect("provisioning should succeed")
-            .expect("the bootstrap record should exist");
+            .expect("provisioning should succeed");
+        let response = expect_provisioned(outcome);
         let data = response.data();
 
         assert_eq!(data.provider_info().enabler_name(), "example");
@@ -885,7 +1060,10 @@ mod tests {
 
         let result = client.provision(&valid_request()).await;
 
-        assert!(matches!(result, Ok(Some(_))), "result: {result:?}");
+        assert!(
+            matches!(result, Ok(ProvisioningOutcome::Provisioned(_))),
+            "result: {result:?}"
+        );
     }
 
     #[tokio::test]

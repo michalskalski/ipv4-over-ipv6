@@ -9,34 +9,52 @@ const V6MIG_SPEC: &str = "v6mig-1";
 const MAX_TTL_SECS: u64 = 604_800;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
+/// Errors returned when parsing and validating a [`Bootstrap`] record.
 pub enum BootstrapError {
+    /// The provisioning endpoint is not a supported HTTP or HTTPS URL.
     #[error("url: {0}, err: {1}")]
     InvalidUrl(String, String),
+    /// The bootstrap record contains an unsupported `t` value.
     #[error("extracting tls policy : {0}")]
     InvalidTlsPolicy(String),
+    /// A bootstrap field does not have its required `key=value` form or order.
     #[error("parsing field, expected: '{0}', got: '{1}'")]
     MalformedField(String, String),
+    /// A required bootstrap field is absent.
     #[error("missing field: {0}")]
     MissingField(&'static str),
+    /// The bootstrap record declares an unsupported protocol version.
     #[error("unsupported spec version: {0}")]
     UnsupportedVersion(String),
+    /// Certificate validation was requested for an HTTP endpoint.
     #[error("tls policy set to validate for http scheme")]
     InvalidTlsForHttp,
+    /// The provisioning URL does not contain a host.
     #[error("provisioning URL must contain a host")]
     MissingUrlHost,
+    /// The record contains fields beyond the three fields defined by HB46PP.
     #[error("record contain data beyond spec fields, record: {0}")]
     InvalidRecord(String),
+    /// The provisioning endpoint uses an IPv4 address instead of IPv6.
     #[error("provisioning URL cannot use an IPv4 address")]
     Ipv4EndpointNotAllowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// An IPv4-over-IPv6 method recognized by HB46PP.
 pub enum Capability {
+    /// 464XLAT.
     Xlat464,
+    /// Dual-Stack Lite.
     DsLite,
+    /// An RFC 2473 IP-in-IP tunnel.
     IpIp,
+    /// Lightweight 4over6.
     Lw4o6,
+    /// Mapping of Address and Port with Encapsulation.
     MapE,
+    /// Mapping of Address and Port using Translation.
     MapT,
 }
 
@@ -50,6 +68,7 @@ impl Capability {
         Self::MapT,
     ];
 
+    /// Returns the capability name used in HB46PP requests and responses.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Xlat464 => "464xlat",
@@ -63,7 +82,9 @@ impl Capability {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when parsing a [`Capability`] name.
 pub enum CapabilityError {
+    /// The name is not one of the capabilities defined by HB46PP.
     #[error("unsupported HB46PP capability: {0}")]
     UnsupportedName(String),
 }
@@ -80,15 +101,21 @@ impl FromStr for Capability {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when constructing a provisioning [`Ttl`].
 pub enum TtlError {
+    /// The lifetime exceeds the protocol maximum of seven days.
     #[error("TTL must be at most {MAX_TTL_SECS} seconds")]
     TooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The validated lifetime of provisioning data, in seconds.
+///
+/// HB46PP limits this value to seven days.
 pub struct Ttl(u32);
 
 impl Ttl {
+    /// Returns the provisioning lifetime in seconds.
     pub fn as_secs(self) -> u32 {
         self.0
     }
@@ -107,13 +134,18 @@ impl TryFrom<u64> for Ttl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The result of user/password authentication reported by the server.
 pub enum AuthStatus {
+    /// Credentials were absent, but providing them may yield more parameters.
     Required,
+    /// Credentials were provided but authentication failed.
     Rejected,
+    /// Credentials were provided and authentication succeeded.
     Accepted,
 }
 
 impl AuthStatus {
+    /// Returns the authentication status value used in an HB46PP response.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Required => "req",
@@ -124,7 +156,9 @@ impl AuthStatus {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when parsing an [`AuthStatus`].
 pub enum AuthStatusError {
+    /// The value is not an authentication status defined by HB46PP.
     #[error("unsupported HB46PP auth status: {0}")]
     UnsupportedStatus(String),
 }
@@ -143,6 +177,11 @@ impl FromStr for AuthStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Informational names identifying the provisioned service and its providers.
+///
+/// These names are intended for display. They distinguish the network operator
+/// enabling IPv4-over-IPv6 connectivity, that operator's service, and an
+/// Internet provider's service offered to customers when all three are supplied.
 pub struct ProviderInfo {
     enabler_name: String,
     service_name: Option<String>,
@@ -150,65 +189,97 @@ pub struct ProviderInfo {
 }
 
 impl ProviderInfo {
+    /// Returns the name of the operator enabling IPv4-over-IPv6 connectivity.
     pub fn enabler_name(&self) -> &str {
         &self.enabler_name
     }
 
+    /// Returns that operator's name for the IPv4-over-IPv6 service, if supplied.
     pub fn service_name(&self) -> Option<&str> {
         self.service_name.as_deref()
     }
 
+    /// Returns the Internet provider's service name, if supplied.
     pub fn isp_name(&self) -> Option<&str> {
         self.isp_name.as_deref()
     }
 }
 
+/// An offer supported by the caller and selected using the server's preference order.
 pub struct SelectedOffer<'a> {
     capability: Capability,
     parameters: &'a serde_json::Value,
 }
 
 impl SelectedOffer<'_> {
+    /// Returns the IPv4-over-IPv6 method selected for this offer.
     pub fn capability(&self) -> Capability {
         self.capability
     }
 
+    /// Returns the method parameters without interpreting their contents.
+    ///
+    /// Parameters are a JSON object for every capability except `ipip`, whose
+    /// parameters are an array containing one JSON object for each tunnel.
     pub fn parameters(&self) -> &serde_json::Value {
         self.parameters
     }
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
+/// Errors returned when parsing and validating [`ProvisioningData`].
 pub enum ProvisioningDataError {
+    /// The outer JSON value is not an object.
     #[error("response is not a JSON object")]
     NotObject,
+    /// A required field is absent from the response.
     #[error("missing required response field: {0}")]
     MissingField(&'static str),
+    /// A field is present with `null` instead of its expected value.
     #[error("response field must not be null: {0}")]
     NullField(&'static str),
+    /// A field cannot be decoded as its expected JSON type.
     #[error("invalid response field {field}: {source}")]
     InvalidField {
+        /// The name of the invalid response field.
         field: &'static str,
+        /// The JSON decoding error for the field.
         #[source]
         source: serde_json::Error,
     },
+    /// An informational name is too large after JSON encoding.
     #[error("response field exceeds 256 bytes including quotes: {0}")]
     InformationalNameTooLong(&'static str),
+    /// The response contains an invalid provisioning lifetime.
     #[error(transparent)]
     Ttl(#[from] TtlError),
+    /// The response contains an invalid token.
     #[error(transparent)]
     Token(#[from] TokenError),
+    /// The response contains an unsupported authentication status.
     #[error(transparent)]
     AuthStatus(#[from] AuthStatusError),
+    /// The response names an unsupported capability.
     #[error(transparent)]
     Capability(#[from] CapabilityError),
+    /// A capability appears more than once in the server preference order.
     #[error("duplicate capability in response order: {0:?}")]
     DuplicateOrder(Capability),
+    /// The preference order names a capability without providing its parameters.
     #[error("response order lists a method without its provisioning payload: {0:?}")]
     MissingOffer(Capability),
+    /// A capability's parameters are not in the JSON shape required by HB46PP.
+    #[error("invalid provisioning payload shape for capability: {0:?}")]
+    InvalidOfferShape(Capability),
 }
 
 #[derive(Debug, Clone)]
+/// Validated provisioning data returned by an HB46PP server.
+///
+/// The type validates the shared response fields and retains each method's
+/// parameters as JSON for interpretation by the application implementing that
+/// method. Unknown fields in the outer object are ignored.
 pub struct ProvisioningData {
     provider_info: ProviderInfo,
     ttl: Option<Ttl>,
@@ -220,6 +291,7 @@ pub struct ProvisioningData {
 }
 
 impl ProvisioningData {
+    /// Parses and validates an HB46PP provisioning JSON object.
     pub fn parse(input: &str) -> Result<Self, ProvisioningDataError> {
         let value =
             serde_json::from_str(input).map_err(|source| ProvisioningDataError::InvalidField {
@@ -262,11 +334,22 @@ impl ProvisioningData {
 
         let mut offers = BTreeMap::new();
         for capability in Capability::ALL {
-            if let Some(parameters) =
-                take_optional::<Map<String, Value>>(&mut fields, capability.as_str())?
-            {
-                offers.insert(capability, Value::Object(parameters));
+            let Some(parameters) = take_optional::<Value>(&mut fields, capability.as_str())? else {
+                continue;
+            };
+
+            let has_valid_shape = match capability {
+                Capability::IpIp => parameters
+                    .as_array()
+                    .is_some_and(|tunnels| tunnels.iter().all(Value::is_object)),
+                _ => parameters.is_object(),
+            };
+
+            if !has_valid_shape {
+                return Err(ProvisioningDataError::InvalidOfferShape(capability));
             }
+
+            offers.insert(capability, parameters);
         }
         for capability in &order {
             if !offers.contains_key(capability) {
@@ -289,6 +372,10 @@ impl ProvisioningData {
         })
     }
 
+    /// Selects the first supported offer in the server's preference order.
+    ///
+    /// The order of `supported` does not affect selection. If none of the
+    /// server's ordered offers are supported, this returns `None`.
     pub fn select(&self, supported: &[Capability]) -> Option<SelectedOffer<'_>> {
         for &capability in self.order() {
             if !supported.contains(&capability) {
@@ -308,30 +395,48 @@ impl ProvisioningData {
         None
     }
 
+    /// Returns the informational service and provider names.
     pub fn provider_info(&self) -> &ProviderInfo {
         &self.provider_info
     }
 
+    /// Returns how long the provisioning data remains valid, if supplied.
     pub fn ttl(&self) -> Option<Ttl> {
         self.ttl
     }
 
+    /// Returns the opaque token for a later provisioning request, if supplied.
+    ///
+    /// The token is sensitive and should not be logged. It must not be
+    /// persisted when the HTTP response prohibits storage.
     pub fn token(&self) -> Option<&Token> {
         self.token.as_ref()
     }
 
+    /// Returns the server's user/password authentication result, if supplied.
     pub fn auth(&self) -> Option<AuthStatus> {
         self.auth
     }
 
+    /// Returns the server's capability preference order.
     pub fn order(&self) -> &[Capability] {
         &self.order
     }
 
+    /// Returns whether the router should provide an IPv6-Mostly local network.
+    ///
+    /// In this mode, local devices primarily use IPv6 and obtain IPv4
+    /// connectivity through 464XLAT. When this is `Some(true)`, the `464xlat`
+    /// offer supplies the NAT64 prefix to advertise to the local network even
+    /// if `464xlat` is absent from the preference order.
     pub fn ipv6_mostly(&self) -> Option<bool> {
         self.ipv6_mostly
     }
 
+    /// Returns the uninterpreted parameters offered for a capability.
+    ///
+    /// An offer may be present even when the capability is not listed in the
+    /// server preference order, as required for IPv6-Mostly provisioning.
     pub fn offer(&self, capability: Capability) -> Option<&Value> {
         self.offers.get(&capability)
     }
@@ -386,23 +491,34 @@ fn validate_informational_name(
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when constructing a [`ProvisioningRequest`].
 pub enum ProvisioningRequestError {
+    /// No supported IPv4-over-IPv6 capability was supplied.
     #[error("at least one capability is required")]
     EmptyCapabilities,
+    /// The supplied capability list contains the same capability more than once.
     #[error("capabilities must not contain duplicates")]
     DuplicateCapability,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when parsing a [`VendorId`].
 pub enum VendorIdError {
+    /// The value does not follow the HB46PP vendor identifier format.
     #[error("vendor ID must be 6 ASCII hex digits with an optional 1..24 character suffix")]
     InvalidFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A validated value for the HB46PP `vendorid` request parameter.
+///
+/// The value starts with the vendor's 24-bit IEEE organization identifier,
+/// written as six hexadecimal digits. It may have a suffix of 1 to 24 ASCII
+/// letters, digits, or underscores separated by `-`.
 pub struct VendorId(String);
 
 impl VendorId {
+    /// Returns the validated vendor identifier.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -435,15 +551,19 @@ impl FromStr for VendorId {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when parsing a [`Product`].
 pub enum ProductError {
+    /// The value does not follow the HB46PP product identifier format.
     #[error("product must be 1..32 ASCII letters, digits, '_' or '-'")]
     InvalidFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A validated value for the HB46PP `product` request parameter.
 pub struct Product(String);
 
 impl Product {
+    /// Returns the validated product identifier.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -467,15 +587,22 @@ impl FromStr for Product {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when parsing a [`FirmwareVersion`].
 pub enum FirmwareVersionError {
+    /// The value does not follow the HB46PP firmware version format.
     #[error("firmware version must be 1..32 ASCII digits or '_'")]
     InvalidFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A validated value for the HB46PP `version` request parameter.
+///
+/// Versions contain only ASCII digits and underscores. A dotted software
+/// version such as `1.2.0` must therefore be supplied as `1_2_0`.
 pub struct FirmwareVersion(String);
 
 impl FirmwareVersion {
+    /// Returns the validated firmware version.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -497,16 +624,23 @@ impl FromStr for FirmwareVersion {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when constructing [`Credentials`].
 pub enum CredentialsError {
+    /// The user name does not follow the HB46PP credential format.
     #[error("user must be at most 32 ASCII letters, digits, '_' or '-'")]
     InvalidUser,
+    /// The password does not follow the HB46PP credential format.
     #[error("password must be at most 32 ASCII letters, digits, '_' or '-'")]
     InvalidPassword,
+    /// The server name cannot be parsed as a URL host.
     #[error("expected server name is not a valid URL host")]
     InvalidExpectedServerName,
 }
 
 #[derive(Clone)]
+/// Optional user name and password sent with a provisioning request.
+///
+/// The custom [`Debug`](fmt::Debug) implementation redacts the password.
 pub struct Credentials {
     user: String,
     password: String,
@@ -551,10 +685,15 @@ impl Credentials {
         })
     }
 
+    /// Returns the user name.
     pub fn user(&self) -> &str {
         &self.user
     }
 
+    /// Returns the password.
+    ///
+    /// The returned value is sensitive and should not be logged or persisted
+    /// without appropriate protection.
     pub fn password(&self) -> &str {
         &self.password
     }
@@ -589,15 +728,24 @@ fn valid_credential_component(value: &str) -> bool {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when parsing a [`Token`].
 pub enum TokenError {
+    /// The value is not exactly 64 lowercase hexadecimal characters.
     #[error("token must be lowercase ASCII hexadecimal only, 64 characters long")]
     InvalidFormat,
 }
 
 #[derive(Clone, PartialEq, Eq)]
+/// An opaque token returned by a provisioning server for a later request.
+///
+/// The custom [`Debug`](fmt::Debug) implementation redacts the token.
 pub struct Token(String);
 
 impl Token {
+    /// Returns the token value.
+    ///
+    /// The returned value is sensitive and should not be logged. It must not
+    /// be persisted when the provisioning response prohibits storage.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -622,16 +770,25 @@ impl FromStr for Token {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors returned when adding restricted credentials to a provisioning URL.
 pub enum ProvisioningUrlError {
+    /// Restricted credentials would be sent over a connection without HTTPS.
     #[error("credentials with an expected server name require HTTPS")]
     CredentialsRequireHttps,
+    /// Restricted credentials would be sent without certificate validation.
     #[error("credentials with an expected server name require certificate validation")]
     CredentialsRequireCertificateValidation,
+    /// The endpoint host does not match the host associated with the credentials.
     #[error("provisioning URL host does not match the expected server name")]
     UnexpectedProvisioningHost,
 }
 
 #[derive(Clone)]
+/// Validated parameters used to request HB46PP provisioning data.
+///
+/// The request identifies the device, declares its supported capabilities,
+/// and may carry a token or credentials. Its custom [`Debug`](fmt::Debug)
+/// implementation redacts those sensitive values.
 pub struct ProvisioningRequest {
     vendor_id: VendorId,
     product: Product,
@@ -642,6 +799,11 @@ pub struct ProvisioningRequest {
 }
 
 impl ProvisioningRequest {
+    /// Creates a provisioning request.
+    ///
+    /// At least one capability is required, and each capability may appear
+    /// only once. The order does not control offer selection; the server's
+    /// response order does.
     pub fn new(
         vendor_id: VendorId,
         product: Product,
@@ -671,26 +833,34 @@ impl ProvisioningRequest {
         })
     }
 
+    /// Returns the device vendor identifier.
     pub fn vendor_id(&self) -> &VendorId {
         &self.vendor_id
     }
 
+    /// Returns the device product identifier.
     pub fn product(&self) -> &Product {
         &self.product
     }
 
+    /// Returns the device firmware version.
     pub fn version(&self) -> &FirmwareVersion {
         &self.version
     }
 
+    /// Returns the capabilities declared by the device.
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
     }
 
+    /// Returns the token to send with this request, if present.
+    ///
+    /// The returned value is sensitive and should not be logged.
     pub fn token(&self) -> Option<&str> {
         self.token.as_ref().map(Token::as_str)
     }
 
+    /// Returns the credentials to send with this request, if present.
     pub fn credentials(&self) -> Option<&Credentials> {
         self.credentials.as_ref()
     }
@@ -710,7 +880,7 @@ impl fmt::Debug for ProvisioningRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// The certificate-validation policy declared by an HB46PP bootstrap record.
+/// The certificate validation policy declared by an HB46PP bootstrap record.
 pub enum TlsPolicy {
     /// Bootstrap field `t=a`: certificate validation is not required.
     NoCertificateValidation, // t=a
@@ -1120,10 +1290,66 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProvisioningDataError::InvalidField {
-                field: "dslite",
-                ..
-            }
+            ProvisioningDataError::InvalidOfferShape(Capability::DsLite)
+        ));
+    }
+
+    #[test]
+    fn accepts_ipip_array_payload() {
+        let response = ProvisioningData::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["ipip"],
+                "ipip": [{
+                    "ipv6_local": "2001:db8:1::1",
+                    "ipv6_remote": "2001:db8:2::1",
+                    "ipv4": "192.0.2.0/29"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.offer(Capability::IpIp),
+            Some(&serde_json::json!([{
+                "ipv6_local": "2001:db8:1::1",
+                "ipv6_remote": "2001:db8:2::1",
+                "ipv4": "192.0.2.0/29"
+            }]))
+        );
+    }
+
+    #[test]
+    fn rejects_ipip_object_payload() {
+        let error = ProvisioningData::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["ipip"],
+                "ipip": {"ipv6_remote": "2001:db8:2::1"}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProvisioningDataError::InvalidOfferShape(Capability::IpIp)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_object_entry_in_ipip_array() {
+        let error = ProvisioningData::parse(
+            r#"{
+                "enabler_name": "example",
+                "order": ["ipip"],
+                "ipip": ["invalid"]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProvisioningDataError::InvalidOfferShape(Capability::IpIp)
         ));
     }
 

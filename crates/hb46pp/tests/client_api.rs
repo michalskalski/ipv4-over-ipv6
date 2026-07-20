@@ -10,7 +10,8 @@ use hb46pp::client::DefaultDiscoveryResolver;
 #[cfg(feature = "default-transport")]
 use hb46pp::client::DefaultTransport;
 use hb46pp::client::{
-    Client, DiscoveryAnswer, DiscoveryResolver, Transport, TransportRequest, TransportResponse,
+    Client, DiscoveryAnswer, DiscoveryResolver, ProvisioningOutcome, Transport, TransportRequest,
+    TransportResponse,
 };
 #[cfg(feature = "default-client")]
 use hb46pp::client::{DefaultClient, DefaultClientError};
@@ -63,6 +64,13 @@ fn downstream_crates_can_implement_discovery_resolver() {
 #[test]
 fn downstream_crates_can_construct_client() {
     let _client = Client::new(FakeResolver, FakeTransport);
+}
+
+#[test]
+fn downstream_crates_can_inspect_next_attempt_window() {
+    let window = ProvisioningOutcome::NotFound.next_attempt_window();
+
+    assert!(window.min() <= window.max());
 }
 
 #[cfg(feature = "default-client")]
