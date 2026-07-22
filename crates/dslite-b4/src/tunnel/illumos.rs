@@ -179,6 +179,18 @@ impl IllumosBackend {
             .map_err(|e| TunnelError::StatusCheckFailed(format!("reading interface flags: {e}")))
     }
 
+    fn get_mtu(&self) -> Result<u32, TunnelError> {
+        let socket = open_inet_dgram_socket().map_err(|e| {
+            TunnelError::StatusCheckFailed(format!("opening interface MTU socket: {e}"))
+        })?;
+        let fd = socket.as_raw_fd();
+
+        // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
+        // which accepts SIOCSLIF* ioctls.
+        unsafe { sys::get_mtu(fd, &self.cname) }
+            .map_err(|e| TunnelError::StatusCheckFailed(format!("reading interface MTU: {e}")))
+    }
+
     fn delete_tunnel(&self, handle: &DladmHandle) -> Result<(), TunnelError> {
         let (link_id, status) = self.name_to_linkid(handle);
         if status != DLADM_STATUS_OK {
@@ -269,11 +281,16 @@ impl TunnelBackend for IllumosBackend {
         })?;
         let fd = sock_fd.as_raw_fd();
 
-        // The four calls below each require an fd that accepts SIOCSLIF*
-        // ioctls. `open_inet_dgram_socket` returns an AF_INET/SOCK_DGRAM
-        // socket, the standard choice on illumos. `sock_fd` (the
-        // `OwnedFd`) lives until function return, so `fd` remains valid
-        // across all four calls.
+        // The calls below each require an fd that accepts SIOCSLIF* ioctls.
+        // `open_inet_dgram_socket` returns an AF_INET/SOCK_DGRAM socket.
+        // `sock_fd` (the `OwnedFd`) lives until function return,
+        // so `fd` remains valid across all calls.
+
+        if let Some(mtu) = desired.mtu {
+            // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
+            unsafe { set_mtu(fd, &self.cname, mtu) }
+                .map_err(|e| TunnelError::CreationFailed(format!("set_mtu: {e}")))?;
+        }
 
         // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
         unsafe { set_local_addr(fd, &self.cname, desired.local_v4) }
@@ -298,6 +315,7 @@ impl TunnelBackend for IllumosBackend {
             local_v6 = %desired.local_v6,
             remote_v6 = %desired.remote_v6,
             local_v4 = %desired.local_v4,
+            mtu = ?desired.mtu,
             "tunnel established"
         );
 
@@ -393,10 +411,12 @@ impl TunnelBackend for IllumosBackend {
         let local_v6 = parse_tunnel_addr(&params.l_addr, "local")?;
         let remote_v6 = parse_tunnel_addr(&params.r_addr, "remote")?;
         let admin_up = self.is_admin_up()?;
+        let mtu = self.get_mtu()?;
 
         Ok(Observed::Present {
             local_v6,
             remote_v6,
+            mtu,
             admin_up,
         })
     }
@@ -603,6 +623,26 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires tunnel state prepared by crates/dslite-b4/scripts/test-illumos-observe.sh"]
+    fn sets_illumos_tunnel_mtu() {
+        let name = std::env::var("DSLITE_TEST_TUNNEL")
+            .expect("DSLITE_TEST_TUNNEL must name the prepared test tunnel");
+        let mtu = std::env::var("DSLITE_TEST_MTU")
+            .expect("DSLITE_TEST_MTU must contain the requested tunnel MTU")
+            .parse()
+            .expect("DSLITE_TEST_MTU must be an unsigned integer");
+        let backend = IllumosBackend::new(name).unwrap();
+        let socket = open_inet_dgram_socket().unwrap();
+        let fd = socket.as_raw_fd();
+
+        // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
+        // which accepts SIOCSLIF* ioctls.
+        unsafe { sys::set_mtu(fd, &backend.cname, mtu) }.unwrap();
+
+        assert_eq!(backend.get_mtu().unwrap(), mtu);
+    }
+
     #[tokio::test]
     #[ignore = "requires tunnel state prepared by crates/dslite-b4/scripts/test-illumos-observe.sh"]
     async fn observes_illumos_tunnel() {
@@ -627,6 +667,10 @@ mod tests {
             .expect("DSLITE_TEST_REMOTE_V6 must contain the prepared remote endpoint")
             .parse()
             .expect("DSLITE_TEST_REMOTE_V6 must be an IPv6 address");
+        let mtu = std::env::var("DSLITE_TEST_MTU")
+            .expect("DSLITE_TEST_MTU must contain the prepared tunnel MTU")
+            .parse()
+            .expect("DSLITE_TEST_MTU must be an unsigned integer");
         let admin_up = match expected.as_str() {
             "present-up" => true,
             "present-down" => false,
@@ -638,6 +682,7 @@ mod tests {
             Observed::Present {
                 local_v6,
                 remote_v6,
+                mtu,
                 admin_up,
             }
         );
@@ -656,6 +701,10 @@ mod tests {
             .expect("DSLITE_TEST_REMOTE_V6 must contain the prepared remote endpoint")
             .parse()
             .expect("DSLITE_TEST_REMOTE_V6 must be an IPv6 address");
+        let mtu = std::env::var("DSLITE_TEST_MTU")
+            .expect("DSLITE_TEST_MTU must contain the prepared tunnel MTU")
+            .parse()
+            .expect("DSLITE_TEST_MTU must be an unsigned integer");
         let backend = IllumosBackend::new(name).unwrap();
 
         backend.bring_up().await.unwrap();
@@ -665,6 +714,7 @@ mod tests {
             Observed::Present {
                 local_v6,
                 remote_v6,
+                mtu,
                 admin_up: true,
             }
         );

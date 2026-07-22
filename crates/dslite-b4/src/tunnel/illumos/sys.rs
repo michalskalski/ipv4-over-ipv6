@@ -115,6 +115,7 @@ pub const LIFNAMSIZ: usize = 32;
 pub union LifrLifru {
     pub addr: libc::sockaddr_storage,
     pub flags: u64,
+    pub mtu: u32,
     _pad: [u8; 336],
 }
 
@@ -170,6 +171,12 @@ pub const SIOCSLIFFLAGS: u32 = ioc(IOC_IN, b'i', 116);
 
 /// `SIOCGLIFFLAGS`, get interface flags.
 pub const SIOCGLIFFLAGS: u32 = ioc(IOC_INOUT, b'i', 117);
+
+/// `SIOCSLIFMTU`, set interface MTU.
+pub const SIOCSLIFMTU: u32 = ioc(IOC_IN, b'i', 121);
+
+/// `SIOCGLIFMTU`, get interface MTU.
+pub const SIOCGLIFMTU: u32 = ioc(IOC_INOUT, b'i', 122);
 
 /// `SIOCSLIFNETMASK`, set subnet mask.
 pub const SIOCSLIFNETMASK: u32 = ioc(IOC_IN, b'i', 126);
@@ -421,6 +428,32 @@ pub unsafe fn set_netmask(sock_fd: c_int, name: &CStr, mask: Ipv4Addr) -> io::Re
     unsafe { set_lifr_addr(sock_fd, name, SIOCSLIFNETMASK, mask) }
 }
 
+/// Set the MTU configured for `name`.
+///
+/// # Safety
+///
+/// - `sock_fd` must be a valid, open file descriptor for a socket that
+///   accepts SIOCSLIF* ioctls (AF_INET / SOCK_DGRAM is the standard
+///   choice on illumos).
+pub unsafe fn set_mtu(sock_fd: c_int, name: &CStr, mtu: u32) -> io::Result<()> {
+    let mut lr = lifreq_for_name(name)?;
+    lr.lifr_lifru.mtu = mtu;
+
+    // SAFETY:
+    // - `sock_fd` is a valid socket fd suitable for SIOCSLIF* ioctls
+    //   (caller's contract).
+    // - `SIOCSLIFMTU` reads the requested interface MTU from the `mtu`
+    //   slot of `lifr_lifru`, which was initialized above.
+    // - `&raw mut lr` points to a fully-initialized 376-byte `Lifreq`
+    //   produced by `lifreq_for_name`. `lr` lives until function return.
+    let rc = unsafe { libc::ioctl(sock_fd, SIOCSLIFMTU as _, &raw mut lr) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 /// Bring `name` up by OR-ing IFF_UP into its existing flags. Read-modify-write
 /// pair (SIOCGLIFFLAGS then SIOCSLIFFLAGS) so other kernel-set flags
 /// (RUNNING, BROADCAST, MULTICAST, ...) are not clobbered. The flags slot
@@ -492,6 +525,33 @@ pub unsafe fn is_up(sock_fd: c_int, name: &CStr) -> io::Result<bool> {
     let flags = unsafe { lr.lifr_lifru.flags };
 
     Ok((flags & IFF_UP) != 0)
+}
+
+/// Return the MTU configured for `name`.
+///
+/// # Safety
+///
+/// - `sock_fd` must be a valid, open file descriptor for a socket that
+///   accepts SIOCSLIF* ioctls (AF_INET / SOCK_DGRAM is the standard
+///   choice on illumos).
+pub unsafe fn get_mtu(sock_fd: c_int, name: &CStr) -> io::Result<u32> {
+    let mut lr = lifreq_for_name(name)?;
+
+    // SAFETY:
+    // - `sock_fd` is a valid socket fd suitable for SIOCSLIF* ioctls
+    //   (caller's contract).
+    // - `SIOCGLIFMTU` writes the interface MTU into the `mtu` slot of
+    //   `lifr_lifru`, expecting a `Lifreq` argument.
+    // - `&raw mut lr` points to a fully-initialized 376-byte `Lifreq`
+    //   produced by `lifreq_for_name`. `lr` lives until function return.
+    let rc = unsafe { libc::ioctl(sock_fd, SIOCGLIFMTU as _, &raw mut lr) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: SIOCGLIFMTU just populated `lr.lifr_lifru.mtu` with a
+    // `u32` from the kernel, so reading that union slot as `u32` is sound.
+    Ok(unsafe { lr.lifr_lifru.mtu })
 }
 
 // PF_ROUTE <net/route.h>

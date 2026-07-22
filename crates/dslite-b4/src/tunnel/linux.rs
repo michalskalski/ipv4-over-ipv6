@@ -18,8 +18,12 @@ fn observed_from_link(link: &LinkMessage) -> Result<Observed, TunnelError> {
     let admin_up = link.header.flags.contains(LinkFlags::Up);
     let mut local_v6 = None;
     let mut remote_v6 = None;
+    let mut mtu = None;
 
     for attribute in &link.attributes {
+        if let LinkAttribute::Mtu(size) = attribute {
+            mtu = Some(*size);
+        }
         let LinkAttribute::LinkInfo(link_info) = attribute else {
             continue;
         };
@@ -49,14 +53,15 @@ fn observed_from_link(link: &LinkMessage) -> Result<Observed, TunnelError> {
         }
     }
 
-    match (local_v6, remote_v6) {
-        (Some(local_v6), Some(remote_v6)) => Ok(Observed::Present {
+    match (local_v6, remote_v6, mtu) {
+        (Some(local_v6), Some(remote_v6), Some(mtu)) => Ok(Observed::Present {
             local_v6,
             remote_v6,
             admin_up,
+            mtu,
         }),
         _ => Err(TunnelError::StatusCheckFailed(format!(
-            "tunnel endpoint missing, local={local_v6:?}, remote={remote_v6:?}"
+            "tunnel state incomplete, local={local_v6:?}, remote={remote_v6:?}, mtu={mtu:?}"
         ))),
     }
 }
@@ -89,16 +94,7 @@ impl LinuxBackend {
         handle: &Handle,
         desired: &DesiredState,
     ) -> Result<u32, TunnelError> {
-        let message = LinkMessageBuilder::<LinkUnspec>::new_with_info_kind(InfoKind::Ip6Tnl)
-            .set_info_data(InfoData::IpTunnel(vec![
-                InfoIpTunnel::Local(std::net::IpAddr::V6(desired.local_v6)),
-                InfoIpTunnel::Remote(std::net::IpAddr::V6(desired.remote_v6)),
-                InfoIpTunnel::Protocol(IpProtocol::Ipip),
-                InfoIpTunnel::Ipv6Flags(Ip6TunnelFlags::IgnEncapLimit), // TODO: make configurable
-            ]))
-            .name(self.name.clone())
-            .up()
-            .build();
+        let message = build_tunnel_message(&self.name, desired);
 
         handle
             .link()
@@ -236,23 +232,43 @@ impl TunnelBackend for LinuxBackend {
     }
 }
 
+fn build_tunnel_message(name: &str, desired: &DesiredState) -> LinkMessage {
+    let mut builder = LinkMessageBuilder::<LinkUnspec>::new_with_info_kind(InfoKind::Ip6Tnl)
+        .set_info_data(InfoData::IpTunnel(vec![
+            InfoIpTunnel::Local(std::net::IpAddr::V6(desired.local_v6)),
+            InfoIpTunnel::Remote(std::net::IpAddr::V6(desired.remote_v6)),
+            InfoIpTunnel::Protocol(IpProtocol::Ipip),
+            InfoIpTunnel::Ipv6Flags(Ip6TunnelFlags::IgnEncapLimit), // TODO: make configurable
+        ]))
+        .name(name.to_string())
+        .up();
+
+    if let Some(mtu) = desired.mtu {
+        builder = builder.mtu(mtu);
+    }
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
 
-    fn tunnel_link(local: IpAddr, remote: IpAddr, admin_up: bool) -> LinkMessage {
+    fn tunnel_link(local: IpAddr, remote: IpAddr, mtu: u32, admin_up: bool) -> LinkMessage {
         let mut link = LinkMessage::default();
         if admin_up {
             link.header.flags.insert(LinkFlags::Up);
         }
-        link.attributes = vec![LinkAttribute::LinkInfo(vec![
-            LinkInfo::Kind(InfoKind::Ip6Tnl),
-            LinkInfo::Data(InfoData::IpTunnel(vec![
-                InfoIpTunnel::Local(local),
-                InfoIpTunnel::Remote(remote),
-            ])),
-        ])];
+        link.attributes = vec![
+            LinkAttribute::LinkInfo(vec![
+                LinkInfo::Kind(InfoKind::Ip6Tnl),
+                LinkInfo::Data(InfoData::IpTunnel(vec![
+                    InfoIpTunnel::Local(local),
+                    InfoIpTunnel::Remote(remote),
+                ])),
+            ]),
+            LinkAttribute::Mtu(mtu),
+        ];
         link
     }
 
@@ -260,7 +276,8 @@ mod tests {
     fn extracts_endpoints_and_admin_state_from_link() {
         let local_v6 = "2001:db8:1::1".parse().unwrap();
         let remote_v6 = "2001:db8:1::2".parse().unwrap();
-        let link = tunnel_link(IpAddr::V6(local_v6), IpAddr::V6(remote_v6), true);
+        let mtu: u32 = 1460;
+        let link = tunnel_link(IpAddr::V6(local_v6), IpAddr::V6(remote_v6), mtu, true);
 
         let observed = observed_from_link(&link).unwrap();
 
@@ -269,6 +286,7 @@ mod tests {
             Observed::Present {
                 local_v6,
                 remote_v6,
+                mtu,
                 admin_up: true,
             }
         );
@@ -280,6 +298,7 @@ mod tests {
         let mut link = tunnel_link(
             IpAddr::V6(local_v6),
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            1460,
             false,
         );
         let LinkAttribute::LinkInfo(link_info) = &mut link.attributes[0] else {
@@ -295,7 +314,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "checking tunnel status: tunnel endpoint missing, local=Some({local_v6}), remote=None"
+                "checking tunnel status: tunnel state incomplete, local=Some({local_v6}), remote=None, mtu=Some(1460)"
             )
         );
     }
@@ -305,6 +324,7 @@ mod tests {
         let link = tunnel_link(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             IpAddr::V6("2001:db8:1::2".parse().unwrap()),
+            1460,
             true,
         );
 
@@ -314,5 +334,43 @@ mod tests {
             error.to_string(),
             "checking tunnel status: expected local IPv6 addr, got: 192.0.2.1"
         );
+    }
+
+    #[test]
+    fn omits_mtu_when_not_configured() {
+        let local_v6 = "2001:db8:1::1".parse().unwrap();
+        let remote_v6 = "2001:db8:1::2".parse().unwrap();
+        let local_v4 = "192.0.0.2".parse().unwrap();
+
+        let desired = DesiredState {
+            local_v6,
+            remote_v6,
+            local_v4,
+            mtu: None,
+        };
+        let msg = build_tunnel_message("tunnel", &desired);
+
+        assert!(
+            !msg.attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::Mtu(_)))
+        );
+    }
+
+    #[test]
+    fn includes_configured_mtu() {
+        let local_v6 = "2001:db8:1::1".parse().unwrap();
+        let remote_v6 = "2001:db8:1::2".parse().unwrap();
+        let local_v4 = "192.0.0.2".parse().unwrap();
+
+        let desired = DesiredState {
+            local_v6,
+            remote_v6,
+            local_v4,
+            mtu: Some(1360),
+        };
+        let msg = build_tunnel_message("tunnel", &desired);
+
+        assert!(msg.attributes.contains(&LinkAttribute::Mtu(1360)));
     }
 }

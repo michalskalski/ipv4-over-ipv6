@@ -19,6 +19,7 @@ pub enum Observed {
     Present {
         local_v6: Ipv6Addr,
         remote_v6: Ipv6Addr,
+        mtu: u32,
         admin_up: bool,
     },
 }
@@ -28,6 +29,7 @@ pub struct DesiredState {
     pub local_v6: Ipv6Addr,
     pub remote_v6: Ipv6Addr,
     pub local_v4: Ipv4Addr,
+    pub mtu: Option<u32>,
 }
 
 #[derive(Debug, Error)]

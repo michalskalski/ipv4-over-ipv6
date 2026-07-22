@@ -24,17 +24,21 @@ fn decide(observed: &Observed, desired: &Desired) -> Action {
             Observed::Present {
                 local_v6,
                 remote_v6,
+                mtu,
                 admin_up,
             },
             Desired::Resolved(endpoints),
-        ) if local_v6 == &endpoints.local_v6 && remote_v6 == &endpoints.remote_v6 => {
+        ) if local_v6 == &endpoints.local_v6
+            && remote_v6 == &endpoints.remote_v6
+            && endpoints.mtu.is_none_or(|desired_mtu| desired_mtu == *mtu) =>
+        {
             if *admin_up {
                 Action::Noop
             } else {
                 Action::BringUp
             }
         }
-        // At least one endpoint differs.
+        // At least one endpoint or the configured MTU differs.
         (Observed::Present { .. }, Desired::Resolved(ds)) => Action::Rebuild(*ds),
     }
 }
@@ -117,6 +121,7 @@ mod tests {
             local_v6,
             remote_v6,
             local_v4: Ipv4Addr::new(192, 0, 0, 2),
+            mtu: None,
         })
     }
 
@@ -139,6 +144,7 @@ mod tests {
         let backend = fake(Observed::Present {
             local_v6,
             remote_v6,
+            mtu: 1460,
             admin_up: false,
         });
         let observed = backend.observe().await.unwrap();
@@ -155,6 +161,7 @@ mod tests {
         let backend = fake(Observed::Present {
             local_v6: Ipv6Addr::LOCALHOST,
             remote_v6: Ipv6Addr::UNSPECIFIED,
+            mtu: 1460,
             admin_up: true,
         });
         let desired = desired(
@@ -179,6 +186,7 @@ mod tests {
         let backend = fake(Observed::Present {
             local_v6,
             remote_v6,
+            mtu: 1460,
             admin_up: true,
         });
         let desired = desired(local_v6, remote_v6);
@@ -195,6 +203,7 @@ mod tests {
         let backend = fake(Observed::Present {
             local_v6: Ipv6Addr::LOCALHOST,
             remote_v6: Ipv6Addr::UNSPECIFIED,
+            mtu: 1460,
             admin_up: true,
         });
         let observed = backend.observe().await.unwrap();
@@ -219,6 +228,7 @@ mod tests {
         let observed = Observed::Present {
             local_v6: addr,
             remote_v6: addr,
+            mtu: 1460,
             admin_up: true,
         };
         let action = decide(&observed, &Desired::Unavailable);
@@ -244,6 +254,7 @@ mod tests {
         let observed = Observed::Present {
             local_v6,
             remote_v6,
+            mtu: 1460,
             admin_up: true,
         };
         let desired = desired(local_v6, remote_v6);
@@ -254,12 +265,60 @@ mod tests {
     }
 
     #[test]
+    fn noop_when_configured_mtu_matches() {
+        let local_v6 = Ipv6Addr::LOCALHOST;
+        let remote_v6 = Ipv6Addr::UNSPECIFIED;
+        let observed = Observed::Present {
+            local_v6,
+            remote_v6,
+            mtu: 1460,
+            admin_up: true,
+        };
+        let desired = Desired::Resolved(DesiredState {
+            local_v6,
+            remote_v6,
+            local_v4: Ipv4Addr::new(192, 0, 0, 2),
+            mtu: Some(1460),
+        });
+
+        let action = decide(&observed, &desired);
+
+        assert_eq!(action, Action::Noop)
+    }
+
+    #[test]
+    fn rebuild_when_configured_mtu_differs() {
+        let local_v6 = Ipv6Addr::LOCALHOST;
+        let remote_v6 = Ipv6Addr::UNSPECIFIED;
+        let observed = Observed::Present {
+            local_v6,
+            remote_v6,
+            mtu: 1460,
+            admin_up: true,
+        };
+        let desired = Desired::Resolved(DesiredState {
+            local_v6,
+            remote_v6,
+            local_v4: Ipv4Addr::new(192, 0, 0, 2),
+            mtu: Some(1360),
+        });
+
+        let action = decide(&observed, &desired);
+
+        let Desired::Resolved(state) = desired else {
+            unreachable!();
+        };
+        assert_eq!(action, Action::Rebuild(state))
+    }
+
+    #[test]
     fn bring_up_when_endpoints_match_and_tunnel_is_down() {
         let local_v6 = Ipv6Addr::LOCALHOST;
         let remote_v6 = Ipv6Addr::UNSPECIFIED;
         let observed = Observed::Present {
             local_v6,
             remote_v6,
+            mtu: 1460,
             admin_up: false,
         };
         let desired = desired(local_v6, remote_v6);
@@ -275,6 +334,7 @@ mod tests {
         let observed = Observed::Present {
             local_v6: Ipv6Addr::LOCALHOST,
             remote_v6,
+            mtu: 1460,
             admin_up: true,
         };
         let desired = desired(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), remote_v6);
@@ -293,6 +353,7 @@ mod tests {
         let observed = Observed::Present {
             local_v6,
             remote_v6: Ipv6Addr::UNSPECIFIED,
+            mtu: 1460,
             admin_up: true,
         };
         let desired = desired(local_v6, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));

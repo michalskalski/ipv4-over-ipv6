@@ -25,6 +25,7 @@ pub struct TunnelConfig {
         deserialize_with = "deserialize_b4_v4"
     )]
     pub local_v4: Ipv4Addr,
+    pub mtu: Option<u32>,
 }
 
 fn deserialize_b4_v4<'de, D>(d: D) -> Result<Ipv4Addr, D::Error>

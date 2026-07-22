@@ -6,6 +6,8 @@ state_dir = "/var/run/dslite-b4"
 # When omitted, local_v6 is discovered from the route to the AFTR.
 # local_v6 = "2001:db8::1"
 local_v4 = "192.0.0.2"
+# Optional. When omitted, the operating-system tunnel default is used.
+# mtu = 1460
 
 [aftr]
 # Optional static override. If omitted, the daemon reads runtime AFTR state.

@@ -200,6 +200,7 @@ async fn compute_desired(
         local_v6,
         remote_v6: aftr_ip,
         local_v4: config.tunnel.local_v4,
+        mtu: config.tunnel.mtu,
     }))
 }
 
