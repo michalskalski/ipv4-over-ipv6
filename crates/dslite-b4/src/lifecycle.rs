@@ -1,4 +1,4 @@
-use crate::tunnel::{DesiredState, Observed, TunnelBackend, TunnelError};
+use crate::tunnel::{DesiredState, Observed, TunnelBackend, TunnelError, TunnelUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Desired {
@@ -7,39 +7,46 @@ pub enum Desired {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
+pub enum Plan {
     Create(DesiredState),
-    BringUp,
+    Update(TunnelUpdate),
     Rebuild(DesiredState),
     Keep,
     Noop,
 }
 
-fn decide(observed: &Observed, desired: &Desired) -> Action {
-    match (observed, desired) {
-        (Observed::Absent, Desired::Unavailable) => Action::Keep,
-        (Observed::Present { .. }, Desired::Unavailable) => Action::Keep,
-        (Observed::Absent, Desired::Resolved(ds)) => Action::Create(*ds),
-        (
-            Observed::Present {
-                local_v6,
-                remote_v6,
-                mtu,
-                admin_up,
-            },
-            Desired::Resolved(endpoints),
-        ) if local_v6 == &endpoints.local_v6
-            && remote_v6 == &endpoints.remote_v6
-            && endpoints.mtu.is_none_or(|desired_mtu| desired_mtu == *mtu) =>
-        {
-            if *admin_up {
-                Action::Noop
-            } else {
-                Action::BringUp
-            }
-        }
-        // At least one endpoint or the configured MTU differs.
-        (Observed::Present { .. }, Desired::Resolved(ds)) => Action::Rebuild(*ds),
+fn decide(observed: &Observed, desired: &Desired) -> Plan {
+    // no desired state - keep
+    let Desired::Resolved(desired) = desired else {
+        return Plan::Keep;
+    };
+
+    // tunnel absent - create
+    let Observed::Present {
+        local_v6,
+        remote_v6,
+        mtu,
+        admin_up,
+    } = observed
+    else {
+        return Plan::Create(*desired);
+    };
+
+    // endpoints different - rebuild
+    if local_v6 != &desired.local_v6 || remote_v6 != &desired.remote_v6 {
+        return Plan::Rebuild(*desired);
+    }
+
+    let update = TunnelUpdate {
+        mtu: desired.mtu.filter(|desired_mtu| desired_mtu != mtu),
+        bring_up: !admin_up,
+    };
+
+    // mutable properties different - update
+    if update.is_empty() {
+        Plan::Noop
+    } else {
+        Plan::Update(update)
     }
 }
 
@@ -47,17 +54,17 @@ pub async fn reconcile_once<B: TunnelBackend>(
     backend: &B,
     observed: &Observed,
     desired: &Desired,
-) -> Result<Action, TunnelError> {
+) -> Result<Plan, TunnelError> {
     let action = decide(observed, desired);
 
     match action {
-        Action::Create(state) => backend.setup(state).await?,
-        Action::BringUp => backend.bring_up().await?,
-        Action::Rebuild(state) => {
+        Plan::Create(state) => backend.setup(state).await?,
+        Plan::Update(update) => backend.update(update).await?,
+        Plan::Rebuild(state) => {
             backend.teardown().await?;
             backend.setup(state).await?;
         }
-        Action::Keep | Action::Noop => {}
+        Plan::Keep | Plan::Noop => {}
     }
 
     Ok(action)
@@ -74,7 +81,7 @@ mod tests {
     enum Call {
         Observe,
         Setup,
-        BringUp,
+        Update(TunnelUpdate),
         Teardown,
     }
 
@@ -96,8 +103,8 @@ mod tests {
             Ok(())
         }
 
-        async fn bring_up(&self) -> Result<(), TunnelError> {
-            self.calls.lock().unwrap().push(Call::BringUp);
+        async fn update(&self, update: TunnelUpdate) -> Result<(), TunnelError> {
+            self.calls.lock().unwrap().push(Call::Update(update));
             Ok(())
         }
 
@@ -133,7 +140,7 @@ mod tests {
 
         let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
-        assert!(matches!(action, Action::Create(_)));
+        assert!(matches!(action, Plan::Create(_)));
         assert_eq!(calls(&backend), [Call::Observe, Call::Setup]);
     }
 
@@ -152,8 +159,40 @@ mod tests {
 
         let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
-        assert_eq!(action, Action::BringUp);
-        assert_eq!(calls(&backend), [Call::Observe, Call::BringUp]);
+        let update = TunnelUpdate {
+            mtu: None,
+            bring_up: true,
+        };
+        assert_eq!(action, Plan::Update(update));
+        assert_eq!(calls(&backend), [Call::Observe, Call::Update(update)]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_updates_different_configured_mtu() {
+        let local_v6 = Ipv6Addr::LOCALHOST;
+        let remote_v6 = Ipv6Addr::UNSPECIFIED;
+        let backend = fake(Observed::Present {
+            local_v6,
+            remote_v6,
+            mtu: 1460,
+            admin_up: true,
+        });
+        let observed = backend.observe().await.unwrap();
+        let desired = Desired::Resolved(DesiredState {
+            local_v6,
+            remote_v6,
+            local_v4: Ipv4Addr::new(192, 0, 0, 2),
+            mtu: Some(1360),
+        });
+
+        let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
+
+        let update = TunnelUpdate {
+            mtu: Some(1360),
+            bring_up: false,
+        };
+        assert_eq!(action, Plan::Update(update));
+        assert_eq!(calls(&backend), [Call::Observe, Call::Update(update)]);
     }
 
     #[tokio::test]
@@ -172,7 +211,7 @@ mod tests {
 
         let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
-        assert!(matches!(action, Action::Rebuild(_)));
+        assert!(matches!(action, Plan::Rebuild(_)));
         assert_eq!(
             calls(&backend),
             [Call::Observe, Call::Teardown, Call::Setup]
@@ -194,7 +233,7 @@ mod tests {
 
         let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
-        assert_eq!(action, Action::Noop);
+        assert_eq!(action, Plan::Noop);
         assert_eq!(calls(&backend), [Call::Observe]);
     }
 
@@ -212,14 +251,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(action, Action::Keep);
+        assert_eq!(action, Plan::Keep);
         assert_eq!(calls(&backend), [Call::Observe]);
     }
 
     #[test]
     fn keep_when_observed_absent_and_desired_unavailable() {
         let action = decide(&Observed::Absent, &Desired::Unavailable);
-        assert_eq!(action, Action::Keep)
+        assert_eq!(action, Plan::Keep)
     }
 
     #[test]
@@ -232,7 +271,7 @@ mod tests {
             admin_up: true,
         };
         let action = decide(&observed, &Desired::Unavailable);
-        assert_eq!(action, Action::Keep)
+        assert_eq!(action, Plan::Keep)
     }
 
     #[test]
@@ -244,7 +283,7 @@ mod tests {
         let Desired::Resolved(state) = desired else {
             unreachable!();
         };
-        assert_eq!(action, Action::Create(state))
+        assert_eq!(action, Plan::Create(state))
     }
 
     #[test]
@@ -261,7 +300,7 @@ mod tests {
 
         let action = decide(&observed, &desired);
 
-        assert_eq!(action, Action::Noop)
+        assert_eq!(action, Plan::Noop)
     }
 
     #[test]
@@ -283,11 +322,11 @@ mod tests {
 
         let action = decide(&observed, &desired);
 
-        assert_eq!(action, Action::Noop)
+        assert_eq!(action, Plan::Noop)
     }
 
     #[test]
-    fn rebuild_when_configured_mtu_differs() {
+    fn update_when_configured_mtu_differs() {
         let local_v6 = Ipv6Addr::LOCALHOST;
         let remote_v6 = Ipv6Addr::UNSPECIFIED;
         let observed = Observed::Present {
@@ -305,14 +344,15 @@ mod tests {
 
         let action = decide(&observed, &desired);
 
-        let Desired::Resolved(state) = desired else {
-            unreachable!();
+        let update = TunnelUpdate {
+            mtu: Some(1360),
+            bring_up: false,
         };
-        assert_eq!(action, Action::Rebuild(state))
+        assert_eq!(action, Plan::Update(update))
     }
 
     #[test]
-    fn bring_up_when_endpoints_match_and_tunnel_is_down() {
+    fn update_when_endpoints_match_and_tunnel_is_down() {
         let local_v6 = Ipv6Addr::LOCALHOST;
         let remote_v6 = Ipv6Addr::UNSPECIFIED;
         let observed = Observed::Present {
@@ -325,7 +365,13 @@ mod tests {
 
         let action = decide(&observed, &desired);
 
-        assert_eq!(action, Action::BringUp)
+        assert_eq!(
+            action,
+            Plan::Update(TunnelUpdate {
+                mtu: None,
+                bring_up: true,
+            })
+        )
     }
 
     #[test]
@@ -344,7 +390,7 @@ mod tests {
         let Desired::Resolved(state) = desired else {
             unreachable!();
         };
-        assert_eq!(action, Action::Rebuild(state))
+        assert_eq!(action, Plan::Rebuild(state))
     }
 
     #[test]
@@ -363,6 +409,6 @@ mod tests {
         let Desired::Resolved(state) = desired else {
             unreachable!();
         };
-        assert_eq!(action, Action::Rebuild(state))
+        assert_eq!(action, Plan::Rebuild(state))
     }
 }

@@ -16,6 +16,7 @@ mod sys;
 use crate::tunnel::illumos::pf_route::RouteSocket;
 use crate::tunnel::{
     AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, Observed, TunnelBackend, TunnelError,
+    TunnelUpdate,
 };
 use std::io;
 use std::mem::MaybeUninit;
@@ -322,16 +323,34 @@ impl TunnelBackend for IllumosBackend {
         Ok(())
     }
 
-    async fn bring_up(&self) -> Result<(), TunnelError> {
+    async fn update(&self, update: TunnelUpdate) -> Result<(), TunnelError> {
         let socket = open_inet_dgram_socket().map_err(|e| {
-            TunnelError::BringUpFailed(format!("opening interface flags socket: {e}"))
+            TunnelError::UpdateFailed(format!("opening interface configuration socket: {e}"))
         })?;
         let fd = socket.as_raw_fd();
 
-        // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
-        // which accepts SIOCSLIF* ioctls.
-        unsafe { sys::bring_up(fd, &self.cname) }
-            .map_err(|e| TunnelError::BringUpFailed(format!("setting interface flags: {e}")))
+        if let Some(mtu) = update.mtu {
+            // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
+            // which accepts SIOCSLIF* ioctls.
+            unsafe { sys::set_mtu(fd, &self.cname, mtu) }
+                .map_err(|e| TunnelError::UpdateFailed(format!("setting interface MTU: {e}")))?;
+        }
+
+        if update.bring_up {
+            // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
+            // which accepts SIOCSLIF* ioctls.
+            unsafe { sys::bring_up(fd, &self.cname) }
+                .map_err(|e| TunnelError::UpdateFailed(format!("setting interface flags: {e}")))?;
+        }
+
+        tracing::info!(
+            name = %self.cname.to_string_lossy(),
+            mtu = ?update.mtu,
+            bring_up = update.bring_up,
+            "interface updated"
+        );
+
+        Ok(())
     }
 
     async fn teardown(&self) -> Result<(), TunnelError> {
@@ -623,9 +642,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires tunnel state prepared by crates/dslite-b4/scripts/test-illumos-observe.sh"]
-    fn sets_illumos_tunnel_mtu() {
+    async fn sets_illumos_tunnel_mtu() {
         let name = std::env::var("DSLITE_TEST_TUNNEL")
             .expect("DSLITE_TEST_TUNNEL must name the prepared test tunnel");
         let mtu = std::env::var("DSLITE_TEST_MTU")
@@ -633,12 +652,14 @@ mod tests {
             .parse()
             .expect("DSLITE_TEST_MTU must be an unsigned integer");
         let backend = IllumosBackend::new(name).unwrap();
-        let socket = open_inet_dgram_socket().unwrap();
-        let fd = socket.as_raw_fd();
 
-        // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
-        // which accepts SIOCSLIF* ioctls.
-        unsafe { sys::set_mtu(fd, &backend.cname, mtu) }.unwrap();
+        backend
+            .update(TunnelUpdate {
+                mtu: Some(mtu),
+                bring_up: false,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(backend.get_mtu().unwrap(), mtu);
     }
@@ -707,7 +728,13 @@ mod tests {
             .expect("DSLITE_TEST_MTU must be an unsigned integer");
         let backend = IllumosBackend::new(name).unwrap();
 
-        backend.bring_up().await.unwrap();
+        backend
+            .update(TunnelUpdate {
+                mtu: None,
+                bring_up: true,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(
             backend.observe().await.unwrap(),

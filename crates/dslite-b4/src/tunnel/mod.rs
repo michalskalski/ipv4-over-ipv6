@@ -32,6 +32,18 @@ pub struct DesiredState {
     pub mtu: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TunnelUpdate {
+    pub mtu: Option<u32>,
+    pub bring_up: bool,
+}
+
+impl TunnelUpdate {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.mtu.is_none() && !self.bring_up
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TunnelError {
     #[error("creating tunnel: {0}")]
@@ -44,13 +56,13 @@ pub enum TunnelError {
     RouteFailed(String),
     #[error("checking tunnel status: {0}")]
     StatusCheckFailed(String),
-    #[error("bring up tunnel: {0}")]
-    BringUpFailed(String),
+    #[error("updating tunnel: {0}")]
+    UpdateFailed(String),
 }
 
 pub trait TunnelBackend: Send + Sync {
     fn setup(&self, desired: DesiredState) -> impl Future<Output = Result<(), TunnelError>> + Send;
-    fn bring_up(&self) -> impl Future<Output = Result<(), TunnelError>> + Send;
+    fn update(&self, update: TunnelUpdate) -> impl Future<Output = Result<(), TunnelError>> + Send;
     fn observe(&self) -> impl Future<Output = Result<Observed, TunnelError>> + Send;
     fn teardown(&self) -> impl Future<Output = Result<(), TunnelError>> + Send;
 }

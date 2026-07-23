@@ -1,5 +1,6 @@
 use crate::tunnel::{
     AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, Observed, TunnelBackend, TunnelError,
+    TunnelUpdate,
 };
 use futures_util::stream::TryStreamExt;
 use rtnetlink::{
@@ -166,30 +167,35 @@ impl TunnelBackend for LinuxBackend {
         Ok(())
     }
 
-    async fn bring_up(&self) -> Result<(), TunnelError> {
+    async fn update(&self, update: TunnelUpdate) -> Result<(), TunnelError> {
         let handle = Self::open_handle()
-            .map_err(|e| TunnelError::BringUpFailed(format!("opening netlink connection: {e}")))?;
+            .map_err(|e| TunnelError::UpdateFailed(format!("opening netlink connection: {e}")))?;
 
         let index = self
             .get_link_index(&handle)
             .await
-            .map_err(|e| TunnelError::BringUpFailed(e.to_string()))?
+            .map_err(|e| TunnelError::UpdateFailed(e.to_string()))?
             .ok_or_else(|| {
-                TunnelError::BringUpFailed(format!("interface {} not found", self.name))
+                TunnelError::UpdateFailed(format!("interface {} not found", self.name))
             })?;
 
-        let message = LinkMessageBuilder::<LinkUnspec>::default()
-            .index(index)
-            .up()
-            .build();
+        let message = build_update_message(index, update);
 
         handle
             .link()
             .change(message)
             .execute()
             .await
-            .map_err(|e| TunnelError::BringUpFailed(e.to_string()))
-            .inspect(|_| tracing::info!(name = %self.name, "interface brought up"))
+            .map_err(|e| TunnelError::UpdateFailed(e.to_string()))?;
+
+        tracing::info!(
+            name = %self.name,
+            mtu = ?update.mtu,
+            bring_up = update.bring_up,
+            "interface updated"
+        );
+
+        Ok(())
     }
 
     async fn observe(&self) -> Result<Observed, TunnelError> {
@@ -246,6 +252,19 @@ fn build_tunnel_message(name: &str, desired: &DesiredState) -> LinkMessage {
     if let Some(mtu) = desired.mtu {
         builder = builder.mtu(mtu);
     }
+    builder.build()
+}
+
+fn build_update_message(index: u32, update: TunnelUpdate) -> LinkMessage {
+    let mut builder = LinkMessageBuilder::<LinkUnspec>::default().index(index);
+
+    if let Some(mtu) = update.mtu {
+        builder = builder.mtu(mtu);
+    }
+    if update.bring_up {
+        builder = builder.up();
+    }
+
     builder.build()
 }
 
@@ -371,6 +390,20 @@ mod tests {
         };
         let msg = build_tunnel_message("tunnel", &desired);
 
+        assert!(msg.attributes.contains(&LinkAttribute::Mtu(1360)));
+    }
+
+    #[test]
+    fn builds_in_place_update() {
+        let update = TunnelUpdate {
+            mtu: Some(1360),
+            bring_up: true,
+        };
+
+        let msg = build_update_message(42, update);
+
+        assert_eq!(msg.header.index, 42);
+        assert!(msg.header.flags.contains(LinkFlags::Up));
         assert!(msg.attributes.contains(&LinkAttribute::Mtu(1360)));
     }
 }
