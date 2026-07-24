@@ -1,8 +1,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU8, NonZeroU64};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
+
+use crate::tunnel::EncapsulationLimit;
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
@@ -26,6 +28,8 @@ pub struct TunnelConfig {
     )]
     pub local_v4: Ipv4Addr,
     pub mtu: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_encapsulation_limit")]
+    pub encapsulation_limit: Option<EncapsulationLimit>,
 }
 
 fn deserialize_b4_v4<'de, D>(d: D) -> Result<Ipv4Addr, D::Error>
@@ -45,6 +49,28 @@ where
         )));
     }
     Ok(addr)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EncapsulationLimitRepr {
+    Value(NonZeroU8),
+    Keyword(String),
+}
+
+fn deserialize_encapsulation_limit<'de, D>(d: D) -> Result<Option<EncapsulationLimit>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match EncapsulationLimitRepr::deserialize(d)? {
+        EncapsulationLimitRepr::Value(n) => Ok(Some(EncapsulationLimit::Value(n))),
+        EncapsulationLimitRepr::Keyword(s) if s == "disabled" => {
+            Ok(Some(EncapsulationLimit::Disabled))
+        }
+        EncapsulationLimitRepr::Keyword(s) => Err(serde::de::Error::custom(format!(
+            "accepted values are an integer from 1 through 255 or 'disabled', got: '{s}'"
+        ))),
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -145,4 +171,68 @@ fn default_discovery_vendorid() -> String {
 
 fn default_discovery_product() -> String {
     "dslite-b4".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_encapsulation_limit() {
+        let cases = [
+            ("", None),
+            (
+                r#"encapsulation_limit = "disabled""#,
+                Some(EncapsulationLimit::Disabled),
+            ),
+            (
+                "encapsulation_limit = 4",
+                Some(EncapsulationLimit::Value(NonZeroU8::new(4).unwrap())),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let config: TunnelConfig = toml::from_str(input).unwrap();
+
+            assert_eq!(config.encapsulation_limit, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_encapsulation_limit() {
+        let cases = [
+            "encapsulation_limit = 0",
+            "encapsulation_limit = 256",
+            r#"encapsulation_limit = "automatic""#,
+        ];
+
+        for input in cases {
+            assert!(toml::from_str::<TunnelConfig>(input).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_b4_v4_host_addresses() {
+        for last_octet in 2..=6 {
+            let input = format!(r#"local_v4 = "192.0.0.{last_octet}""#);
+            let config: TunnelConfig = toml::from_str(&input).unwrap();
+
+            assert_eq!(config.local_v4, Ipv4Addr::new(192, 0, 0, last_octet));
+        }
+    }
+
+    #[test]
+    fn rejects_non_b4_v4_host_addresses() {
+        let cases = [
+            r#"local_v4 = "192.0.0.0""#,
+            r#"local_v4 = "192.0.0.1""#,
+            r#"local_v4 = "192.0.0.7""#,
+            r#"local_v4 = "192.0.1.2""#,
+            r#"local_v4 = "198.51.100.2""#,
+        ];
+
+        for input in cases {
+            assert!(toml::from_str::<TunnelConfig>(input).is_err());
+        }
+    }
 }

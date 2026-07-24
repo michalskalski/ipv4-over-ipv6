@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    num::NonZeroU8,
+};
 use thiserror::Error;
 
 // RFC 6333 5.7: AFTR element reserved address
@@ -58,6 +61,12 @@ pub enum TunnelError {
     StatusCheckFailed(String),
     #[error("updating tunnel: {0}")]
     UpdateFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncapsulationLimit {
+    Disabled,
+    Value(NonZeroU8),
 }
 
 pub trait TunnelBackend: Send + Sync {
