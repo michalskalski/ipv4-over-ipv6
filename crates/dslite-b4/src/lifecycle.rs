@@ -1,4 +1,6 @@
-use crate::tunnel::{DesiredState, Observed, TunnelBackend, TunnelError, TunnelUpdate};
+use crate::tunnel::{
+    DesiredState, EncapsulationLimit, Observed, TunnelBackend, TunnelError, TunnelUpdate,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Desired {
@@ -9,7 +11,10 @@ pub enum Desired {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
     Create(DesiredState),
-    Update(TunnelUpdate),
+    Update {
+        desired: DesiredState,
+        changes: TunnelUpdate,
+    },
     Rebuild(DesiredState),
     Keep,
     Noop,
@@ -26,6 +31,7 @@ fn decide(observed: &Observed, desired: &Desired) -> Plan {
         local_v6,
         remote_v6,
         mtu,
+        encapsulation_limit,
         admin_up,
     } = observed
     else {
@@ -37,8 +43,16 @@ fn decide(observed: &Observed, desired: &Desired) -> Plan {
         return Plan::Rebuild(*desired);
     }
 
+    let encapsulation_limit_update = match desired.encapsulation_limit {
+        None => None,
+        Some(EncapsulationLimit::Disabled) if encapsulation_limit.is_none() => None,
+        Some(EncapsulationLimit::Value(limit)) if *encapsulation_limit == Some(limit.get()) => None,
+        Some(limit) => Some(limit),
+    };
+
     let update = TunnelUpdate {
         mtu: desired.mtu.filter(|desired_mtu| desired_mtu != mtu),
+        encapsulation_limit: encapsulation_limit_update,
         bring_up: !admin_up,
     };
 
@@ -46,7 +60,10 @@ fn decide(observed: &Observed, desired: &Desired) -> Plan {
     if update.is_empty() {
         Plan::Noop
     } else {
-        Plan::Update(update)
+        Plan::Update {
+            desired: *desired,
+            changes: update,
+        }
     }
 }
 
@@ -59,7 +76,7 @@ pub async fn reconcile_once<B: TunnelBackend>(
 
     match action {
         Plan::Create(state) => backend.setup(state).await?,
-        Plan::Update(update) => backend.update(update).await?,
+        Plan::Update { desired, changes } => backend.update(desired, changes).await?,
         Plan::Rebuild(state) => {
             backend.teardown().await?;
             backend.setup(state).await?;
@@ -72,9 +89,10 @@ pub async fn reconcile_once<B: TunnelBackend>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{num::NonZeroU8, sync::Mutex};
 
     use super::*;
+    use crate::tunnel::EncapsulationLimit;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +121,11 @@ mod tests {
             Ok(())
         }
 
-        async fn update(&self, update: TunnelUpdate) -> Result<(), TunnelError> {
+        async fn update(
+            &self,
+            _desired: DesiredState,
+            update: TunnelUpdate,
+        ) -> Result<(), TunnelError> {
             self.calls.lock().unwrap().push(Call::Update(update));
             Ok(())
         }
@@ -129,7 +151,15 @@ mod tests {
             remote_v6,
             local_v4: Ipv4Addr::new(192, 0, 0, 2),
             mtu: None,
+            encapsulation_limit: None,
         })
+    }
+
+    fn resolved_state(desired: Desired) -> DesiredState {
+        let Desired::Resolved(state) = desired else {
+            unreachable!();
+        };
+        state
     }
 
     #[tokio::test]
@@ -152,6 +182,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: false,
         });
         let observed = backend.observe().await.unwrap();
@@ -161,9 +192,16 @@ mod tests {
 
         let update = TunnelUpdate {
             mtu: None,
+            encapsulation_limit: None,
             bring_up: true,
         };
-        assert_eq!(action, Plan::Update(update));
+        assert_eq!(
+            action,
+            Plan::Update {
+                desired: resolved_state(desired),
+                changes: update,
+            }
+        );
         assert_eq!(calls(&backend), [Call::Observe, Call::Update(update)]);
     }
 
@@ -175,6 +213,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         });
         let observed = backend.observe().await.unwrap();
@@ -183,15 +222,23 @@ mod tests {
             remote_v6,
             local_v4: Ipv4Addr::new(192, 0, 0, 2),
             mtu: Some(1360),
+            encapsulation_limit: None,
         });
 
         let action = reconcile_once(&backend, &observed, &desired).await.unwrap();
 
         let update = TunnelUpdate {
             mtu: Some(1360),
+            encapsulation_limit: None,
             bring_up: false,
         };
-        assert_eq!(action, Plan::Update(update));
+        assert_eq!(
+            action,
+            Plan::Update {
+                desired: resolved_state(desired),
+                changes: update,
+            }
+        );
         assert_eq!(calls(&backend), [Call::Observe, Call::Update(update)]);
     }
 
@@ -201,6 +248,7 @@ mod tests {
             local_v6: Ipv6Addr::LOCALHOST,
             remote_v6: Ipv6Addr::UNSPECIFIED,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         });
         let desired = desired(
@@ -226,6 +274,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         });
         let desired = desired(local_v6, remote_v6);
@@ -243,6 +292,7 @@ mod tests {
             local_v6: Ipv6Addr::LOCALHOST,
             remote_v6: Ipv6Addr::UNSPECIFIED,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         });
         let observed = backend.observe().await.unwrap();
@@ -268,6 +318,7 @@ mod tests {
             local_v6: addr,
             remote_v6: addr,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         };
         let action = decide(&observed, &Desired::Unavailable);
@@ -294,6 +345,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         };
         let desired = desired(local_v6, remote_v6);
@@ -311,6 +363,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         };
         let desired = Desired::Resolved(DesiredState {
@@ -318,6 +371,7 @@ mod tests {
             remote_v6,
             local_v4: Ipv4Addr::new(192, 0, 0, 2),
             mtu: Some(1460),
+            encapsulation_limit: None,
         });
 
         let action = decide(&observed, &desired);
@@ -333,6 +387,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         };
         let desired = Desired::Resolved(DesiredState {
@@ -340,15 +395,23 @@ mod tests {
             remote_v6,
             local_v4: Ipv4Addr::new(192, 0, 0, 2),
             mtu: Some(1360),
+            encapsulation_limit: None,
         });
 
         let action = decide(&observed, &desired);
 
         let update = TunnelUpdate {
             mtu: Some(1360),
+            encapsulation_limit: None,
             bring_up: false,
         };
-        assert_eq!(action, Plan::Update(update))
+        assert_eq!(
+            action,
+            Plan::Update {
+                desired: resolved_state(desired),
+                changes: update,
+            }
+        )
     }
 
     #[test]
@@ -359,6 +422,7 @@ mod tests {
             local_v6,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: false,
         };
         let desired = desired(local_v6, remote_v6);
@@ -367,11 +431,73 @@ mod tests {
 
         assert_eq!(
             action,
-            Plan::Update(TunnelUpdate {
-                mtu: None,
-                bring_up: true,
-            })
+            Plan::Update {
+                desired: resolved_state(desired),
+                changes: TunnelUpdate {
+                    mtu: None,
+                    encapsulation_limit: None,
+                    bring_up: true,
+                },
+            }
         )
+    }
+
+    #[test]
+    fn plans_encapsulation_limit_updates() {
+        let value = EncapsulationLimit::Value(NonZeroU8::new(4).unwrap());
+        let cases = [
+            ("omitted", None, Some(4), None),
+            (
+                "disabled and absent",
+                Some(EncapsulationLimit::Disabled),
+                None,
+                None,
+            ),
+            (
+                "disabled but present",
+                Some(EncapsulationLimit::Disabled),
+                Some(4),
+                Some(EncapsulationLimit::Disabled),
+            ),
+            ("matching value", Some(value), Some(4), None),
+            ("value but absent", Some(value), None, Some(value)),
+            ("different value", Some(value), Some(5), Some(value)),
+            ("zero-valued option", Some(value), Some(0), Some(value)),
+        ];
+
+        for (name, desired_limit, observed_limit, expected_update) in cases {
+            let local_v6 = Ipv6Addr::LOCALHOST;
+            let remote_v6 = Ipv6Addr::UNSPECIFIED;
+            let observed = Observed::Present {
+                local_v6,
+                remote_v6,
+                mtu: 1460,
+                encapsulation_limit: observed_limit,
+                admin_up: true,
+            };
+            let desired = Desired::Resolved(DesiredState {
+                local_v6,
+                remote_v6,
+                local_v4: Ipv4Addr::new(192, 0, 0, 2),
+                mtu: None,
+                encapsulation_limit: desired_limit,
+            });
+
+            let action = decide(&observed, &desired);
+            let expected = match expected_update {
+                Some(encapsulation_limit) => Plan::Update {
+                    desired: resolved_state(desired),
+                    changes: TunnelUpdate {
+                        mtu: None,
+                        encapsulation_limit: Some(encapsulation_limit),
+                        bring_up: false,
+                    },
+                },
+                None => Plan::Noop,
+            };
+
+            assert_eq!(action, expected, "{name}");
+        }
     }
 
     #[test]
@@ -381,6 +507,7 @@ mod tests {
             local_v6: Ipv6Addr::LOCALHOST,
             remote_v6,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         };
         let desired = desired(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), remote_v6);
@@ -400,6 +527,7 @@ mod tests {
             local_v6,
             remote_v6: Ipv6Addr::UNSPECIFIED,
             mtu: 1460,
+            encapsulation_limit: None,
             admin_up: true,
         };
         let desired = desired(local_v6, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));

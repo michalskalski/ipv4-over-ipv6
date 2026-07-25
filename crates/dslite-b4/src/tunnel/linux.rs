@@ -1,6 +1,6 @@
 use crate::tunnel::{
-    AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, Observed, TunnelBackend, TunnelError,
-    TunnelUpdate,
+    AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, EncapsulationLimit, Observed, TunnelBackend,
+    TunnelError, TunnelUpdate,
 };
 use futures_util::stream::TryStreamExt;
 use rtnetlink::{
@@ -20,6 +20,8 @@ fn observed_from_link(link: &LinkMessage) -> Result<Observed, TunnelError> {
     let mut local_v6 = None;
     let mut remote_v6 = None;
     let mut mtu = None;
+    let mut encapsulation_limit = None;
+    let mut ipv6_flags = None;
 
     for attribute in &link.attributes {
         if let LinkAttribute::Mtu(size) = attribute {
@@ -48,21 +50,34 @@ fn observed_from_link(link: &LinkMessage) -> Result<Observed, TunnelError> {
                             "expected remote IPv6 addr, got: {addr}"
                         )));
                     }
+                    InfoIpTunnel::EncapLimit(limit) => encapsulation_limit = Some(*limit),
+                    InfoIpTunnel::Ipv6Flags(flags) => {
+                        ipv6_flags = Some(*flags);
+                    }
                     _ => {}
                 }
             }
         }
     }
+    match (local_v6, remote_v6, mtu, encapsulation_limit, ipv6_flags) {
+        (Some(local_v6), Some(remote_v6), Some(mtu), Some(reported_limit), Some(flags)) => {
+            let encapsulation_limit = if flags.contains(Ip6TunnelFlags::IgnEncapLimit) {
+                None
+            } else {
+                Some(reported_limit)
+            };
 
-    match (local_v6, remote_v6, mtu) {
-        (Some(local_v6), Some(remote_v6), Some(mtu)) => Ok(Observed::Present {
-            local_v6,
-            remote_v6,
-            admin_up,
-            mtu,
-        }),
+            Ok(Observed::Present {
+                local_v6,
+                remote_v6,
+                admin_up,
+                mtu,
+                encapsulation_limit,
+            })
+        }
         _ => Err(TunnelError::StatusCheckFailed(format!(
-            "tunnel state incomplete, local={local_v6:?}, remote={remote_v6:?}, mtu={mtu:?}"
+            "tunnel state incomplete, local={local_v6:?}, remote={remote_v6:?}, mtu={mtu:?}, \
+             encapsulation_limit={encapsulation_limit:?}, ipv6_flags={ipv6_flags:?}"
         ))),
     }
 }
@@ -167,7 +182,7 @@ impl TunnelBackend for LinuxBackend {
         Ok(())
     }
 
-    async fn update(&self, update: TunnelUpdate) -> Result<(), TunnelError> {
+    async fn update(&self, desired: DesiredState, update: TunnelUpdate) -> Result<(), TunnelError> {
         let handle = Self::open_handle()
             .map_err(|e| TunnelError::UpdateFailed(format!("opening netlink connection: {e}")))?;
 
@@ -179,7 +194,7 @@ impl TunnelBackend for LinuxBackend {
                 TunnelError::UpdateFailed(format!("interface {} not found", self.name))
             })?;
 
-        let message = build_update_message(index, update);
+        let message = build_update_message(index, &desired, update);
 
         handle
             .link()
@@ -191,6 +206,7 @@ impl TunnelBackend for LinuxBackend {
         tracing::info!(
             name = %self.name,
             mtu = ?update.mtu,
+            encapsulation_limit = ?update.encapsulation_limit,
             bring_up = update.bring_up,
             "interface updated"
         );
@@ -238,14 +254,31 @@ impl TunnelBackend for LinuxBackend {
     }
 }
 
+fn build_tunnel_info(desired: &DesiredState) -> Vec<InfoIpTunnel> {
+    let mut tunnel_info = vec![
+        InfoIpTunnel::Local(std::net::IpAddr::V6(desired.local_v6)),
+        InfoIpTunnel::Remote(std::net::IpAddr::V6(desired.remote_v6)),
+        InfoIpTunnel::Protocol(IpProtocol::Ipip),
+    ];
+
+    if let Some(encap_limit) = desired.encapsulation_limit {
+        match encap_limit {
+            EncapsulationLimit::Disabled => {
+                tunnel_info.push(InfoIpTunnel::Ipv6Flags(Ip6TunnelFlags::IgnEncapLimit))
+            }
+            EncapsulationLimit::Value(n) => {
+                tunnel_info.push(InfoIpTunnel::EncapLimit(n.get()));
+                tunnel_info.push(InfoIpTunnel::Ipv6Flags(Ip6TunnelFlags::empty()));
+            }
+        }
+    }
+
+    tunnel_info
+}
+
 fn build_tunnel_message(name: &str, desired: &DesiredState) -> LinkMessage {
     let mut builder = LinkMessageBuilder::<LinkUnspec>::new_with_info_kind(InfoKind::Ip6Tnl)
-        .set_info_data(InfoData::IpTunnel(vec![
-            InfoIpTunnel::Local(std::net::IpAddr::V6(desired.local_v6)),
-            InfoIpTunnel::Remote(std::net::IpAddr::V6(desired.remote_v6)),
-            InfoIpTunnel::Protocol(IpProtocol::Ipip),
-            InfoIpTunnel::Ipv6Flags(Ip6TunnelFlags::IgnEncapLimit), // TODO: make configurable
-        ]))
+        .set_info_data(InfoData::IpTunnel(build_tunnel_info(desired)))
         .name(name.to_string())
         .up();
 
@@ -255,8 +288,14 @@ fn build_tunnel_message(name: &str, desired: &DesiredState) -> LinkMessage {
     builder.build()
 }
 
-fn build_update_message(index: u32, update: TunnelUpdate) -> LinkMessage {
-    let mut builder = LinkMessageBuilder::<LinkUnspec>::default().index(index);
+fn build_update_message(index: u32, desired: &DesiredState, update: TunnelUpdate) -> LinkMessage {
+    let mut builder = if update.encapsulation_limit.is_some() {
+        LinkMessageBuilder::<LinkUnspec>::new_with_info_kind(InfoKind::Ip6Tnl)
+            .set_info_data(InfoData::IpTunnel(build_tunnel_info(desired)))
+    } else {
+        LinkMessageBuilder::<LinkUnspec>::default()
+    }
+    .index(index);
 
     if let Some(mtu) = update.mtu {
         builder = builder.mtu(mtu);
@@ -271,7 +310,25 @@ fn build_update_message(index: u32, update: TunnelUpdate) -> LinkMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
+    use std::{net::Ipv6Addr, num::NonZeroU8};
+
+    fn ip_tunnel_info(message: &LinkMessage) -> &[InfoIpTunnel] {
+        message
+            .attributes
+            .iter()
+            .find_map(|attribute| {
+                let LinkAttribute::LinkInfo(link_info) = attribute else {
+                    return None;
+                };
+                link_info.iter().find_map(|info| {
+                    let LinkInfo::Data(InfoData::IpTunnel(tunnel_info)) = info else {
+                        return None;
+                    };
+                    Some(tunnel_info.as_slice())
+                })
+            })
+            .expect("message must contain IP tunnel information")
+    }
 
     fn tunnel_link(local: IpAddr, remote: IpAddr, mtu: u32, admin_up: bool) -> LinkMessage {
         let mut link = LinkMessage::default();
@@ -284,6 +341,8 @@ mod tests {
                 LinkInfo::Data(InfoData::IpTunnel(vec![
                     InfoIpTunnel::Local(local),
                     InfoIpTunnel::Remote(remote),
+                    InfoIpTunnel::EncapLimit(4),
+                    InfoIpTunnel::Ipv6Flags(Ip6TunnelFlags::empty()),
                 ])),
             ]),
             LinkAttribute::Mtu(mtu),
@@ -306,6 +365,40 @@ mod tests {
                 local_v6,
                 remote_v6,
                 mtu,
+                encapsulation_limit: Some(4),
+                admin_up: true,
+            }
+        );
+    }
+
+    #[test]
+    fn observes_ignored_encapsulation_limit_as_disabled() {
+        let local_v6 = "2001:db8:1::1".parse().unwrap();
+        let remote_v6 = "2001:db8:1::2".parse().unwrap();
+        let mut link = tunnel_link(IpAddr::V6(local_v6), IpAddr::V6(remote_v6), 1460, true);
+        let LinkAttribute::LinkInfo(link_info) = &mut link.attributes[0] else {
+            unreachable!();
+        };
+        let LinkInfo::Data(InfoData::IpTunnel(tunnel_info)) = &mut link_info[1] else {
+            unreachable!();
+        };
+        let Some(InfoIpTunnel::Ipv6Flags(flags)) = tunnel_info
+            .iter_mut()
+            .find(|info| matches!(info, InfoIpTunnel::Ipv6Flags(_)))
+        else {
+            unreachable!();
+        };
+        flags.insert(Ip6TunnelFlags::IgnEncapLimit);
+
+        let observed = observed_from_link(&link).unwrap();
+
+        assert_eq!(
+            observed,
+            Observed::Present {
+                local_v6,
+                remote_v6,
+                mtu: 1460,
+                encapsulation_limit: None,
                 admin_up: true,
             }
         );
@@ -333,7 +426,9 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "checking tunnel status: tunnel state incomplete, local=Some({local_v6}), remote=None, mtu=Some(1460)"
+                "checking tunnel status: tunnel state incomplete, local=Some({local_v6}), \
+                 remote=None, mtu=Some(1460), encapsulation_limit=Some(4), \
+                 ipv6_flags=Some(Ip6TunnelFlags(0x0))"
             )
         );
     }
@@ -366,6 +461,7 @@ mod tests {
             remote_v6,
             local_v4,
             mtu: None,
+            encapsulation_limit: None,
         };
         let msg = build_tunnel_message("tunnel", &desired);
 
@@ -387,6 +483,7 @@ mod tests {
             remote_v6,
             local_v4,
             mtu: Some(1360),
+            encapsulation_limit: None,
         };
         let msg = build_tunnel_message("tunnel", &desired);
 
@@ -394,16 +491,118 @@ mod tests {
     }
 
     #[test]
+    fn configures_encapsulation_limit_on_creation() {
+        let value = EncapsulationLimit::Value(NonZeroU8::new(7).unwrap());
+        let cases = [
+            ("omitted", None, None, false),
+            ("disabled", Some(EncapsulationLimit::Disabled), None, true),
+            ("explicit value", Some(value), Some(7), false),
+        ];
+
+        for (name, desired_limit, expected_limit, expected_ignored) in cases {
+            let desired = DesiredState {
+                local_v6: "2001:db8:1::1".parse().unwrap(),
+                remote_v6: "2001:db8:1::2".parse().unwrap(),
+                local_v4: "192.0.0.2".parse().unwrap(),
+                mtu: None,
+                encapsulation_limit: desired_limit,
+            };
+
+            let message = build_tunnel_message("tunnel", &desired);
+            let tunnel_info = ip_tunnel_info(&message);
+            let reported_limit = tunnel_info.iter().find_map(|info| match info {
+                InfoIpTunnel::EncapLimit(limit) => Some(*limit),
+                _ => None,
+            });
+            let ignored = tunnel_info.iter().any(|info| {
+                matches!(
+                    info,
+                    InfoIpTunnel::Ipv6Flags(flags)
+                        if flags.contains(Ip6TunnelFlags::IgnEncapLimit)
+                )
+            });
+
+            assert_eq!(reported_limit, expected_limit, "{name}");
+            assert_eq!(ignored, expected_ignored, "{name}");
+        }
+    }
+
+    #[test]
     fn builds_in_place_update() {
+        let desired = DesiredState {
+            local_v6: "2001:db8:1::1".parse().unwrap(),
+            remote_v6: "2001:db8:1::2".parse().unwrap(),
+            local_v4: "192.0.0.2".parse().unwrap(),
+            mtu: Some(1360),
+            encapsulation_limit: None,
+        };
         let update = TunnelUpdate {
             mtu: Some(1360),
+            encapsulation_limit: None,
             bring_up: true,
         };
 
-        let msg = build_update_message(42, update);
+        let msg = build_update_message(42, &desired, update);
 
         assert_eq!(msg.header.index, 42);
         assert!(msg.header.flags.contains(LinkFlags::Up));
         assert!(msg.attributes.contains(&LinkAttribute::Mtu(1360)));
+        assert!(
+            !msg.attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::LinkInfo(_)))
+        );
+    }
+
+    #[test]
+    fn configures_encapsulation_limit_in_place() {
+        let value = EncapsulationLimit::Value(NonZeroU8::new(7).unwrap());
+        let cases = [
+            (
+                "disabled",
+                EncapsulationLimit::Disabled,
+                None,
+                Ip6TunnelFlags::IgnEncapLimit,
+            ),
+            ("explicit value", value, Some(7), Ip6TunnelFlags::empty()),
+        ];
+
+        for (name, desired_limit, expected_limit, expected_flags) in cases {
+            let desired = DesiredState {
+                local_v6: "2001:db8:1::1".parse().unwrap(),
+                remote_v6: "2001:db8:1::2".parse().unwrap(),
+                local_v4: "192.0.0.2".parse().unwrap(),
+                mtu: None,
+                encapsulation_limit: Some(desired_limit),
+            };
+            let update = TunnelUpdate {
+                mtu: None,
+                encapsulation_limit: Some(desired_limit),
+                bring_up: false,
+            };
+
+            let message = build_update_message(42, &desired, update);
+            let tunnel_info = ip_tunnel_info(&message);
+            let reported_limit = tunnel_info.iter().find_map(|info| match info {
+                InfoIpTunnel::EncapLimit(limit) => Some(*limit),
+                _ => None,
+            });
+            let flags = tunnel_info.iter().find_map(|info| match info {
+                InfoIpTunnel::Ipv6Flags(flags) => Some(*flags),
+                _ => None,
+            });
+
+            assert_eq!(reported_limit, expected_limit, "{name}");
+            assert_eq!(flags, Some(expected_flags), "{name}");
+            assert!(
+                tunnel_info.contains(&InfoIpTunnel::Local(std::net::IpAddr::V6(desired.local_v6)))
+            );
+            assert!(
+                tunnel_info.contains(&InfoIpTunnel::Remote(std::net::IpAddr::V6(
+                    desired.remote_v6
+                )))
+            );
+            assert!(tunnel_info.contains(&InfoIpTunnel::Protocol(IpProtocol::Ipip)));
+        }
     }
 }

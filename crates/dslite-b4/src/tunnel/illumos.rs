@@ -15,13 +15,13 @@ mod sys;
 
 use crate::tunnel::illumos::pf_route::RouteSocket;
 use crate::tunnel::{
-    AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, Observed, TunnelBackend, TunnelError,
-    TunnelUpdate,
+    AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, EncapsulationLimit, Observed, TunnelBackend,
+    TunnelError, TunnelUpdate,
 };
 use std::io;
 use std::mem::MaybeUninit;
 use std::{
-    ffi::{CString, c_char, c_void},
+    ffi::{CStr, CString, c_char, c_uint, c_void},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
@@ -168,6 +168,90 @@ impl IllumosBackend {
         Ok(Some(params))
     }
 
+    fn get_encapsulation_limit(
+        &self,
+        handle: &DladmHandle,
+        link_id: u32,
+    ) -> Result<Option<u8>, TunnelError> {
+        let mut value = [0_u8; DLADM_PROP_VAL_MAX];
+        let mut values = [value.as_mut_ptr().cast::<c_char>()];
+        let mut value_count: c_uint = 1;
+
+        // SAFETY:
+        // - `handle.ptr` is a live libdladm handle.
+        // - `c"encaplimit"` is a static NUL-terminated string.
+        // - `values` contains one pointer to a writable
+        //   `DLADM_PROP_VAL_MAX`-byte buffer.
+        // - `value_count` initially describes the one available buffer and
+        //   remains valid for writes during the call.
+        let status = unsafe {
+            dladm_get_linkprop(
+                handle.ptr,
+                link_id,
+                DLADM_PROP_VAL_CURRENT,
+                c"encaplimit".as_ptr(),
+                values.as_mut_ptr(),
+                &mut value_count,
+            )
+        };
+
+        if status != DLADM_STATUS_OK {
+            return Err(TunnelError::StatusCheckFailed(format!(
+                "reading encaplimit, dladm_get_linkprop status: {status}"
+            )));
+        }
+
+        let value = CStr::from_bytes_until_nul(&value)
+            .map_err(|e| TunnelError::StatusCheckFailed(format!("invalid encaplimit value: {e}")))?
+            .to_str()
+            .map_err(|e| TunnelError::StatusCheckFailed(format!("encaplimit is not UTF-8: {e}")))?
+            .parse::<u8>()
+            .map_err(|e| {
+                TunnelError::StatusCheckFailed(format!("invalid encaplimit number: {e}"))
+            })?;
+
+        Ok((value != 0).then_some(value))
+    }
+
+    fn set_encapsulation_limit(
+        &self,
+        handle: &DladmHandle,
+        link_id: u32,
+        encapsulation_limit: EncapsulationLimit,
+    ) -> Result<(), u32> {
+        let value = match encapsulation_limit {
+            EncapsulationLimit::Disabled => 0,
+            EncapsulationLimit::Value(value) => value.get(),
+        };
+        let mut value = value.to_string().into_bytes();
+        value.push(0);
+        let mut values = [value.as_mut_ptr().cast::<c_char>()];
+
+        // SAFETY:
+        // - `handle.ptr` is a live libdladm handle.
+        // - `link_id` identifies a link returned by libdladm.
+        // - `c"encaplimit"` is a static NUL-terminated string.
+        // - `values` contains one pointer to a writable, NUL-terminated
+        //   decimal string. Both arrays remain live for the call.
+        // - `value_count` is one, matching the single pointer in `values`.
+        let status = unsafe {
+            dladm_set_linkprop(
+                handle.ptr,
+                link_id,
+                c"encaplimit".as_ptr(),
+                values.as_mut_ptr(),
+                1,
+                DLADM_OPT_ACTIVE,
+            )
+        };
+
+        if status != DLADM_STATUS_OK {
+            return Err(status);
+        }
+
+        Ok(())
+    }
+
     fn is_admin_up(&self) -> Result<bool, TunnelError> {
         let socket = open_inet_dgram_socket().map_err(|e| {
             TunnelError::StatusCheckFailed(format!("opening interface flags socket: {e}"))
@@ -270,7 +354,16 @@ impl TunnelBackend for IllumosBackend {
         let handle = open_dladm().map_err(|e| {
             TunnelError::CreationFailed(format!("unable to open handle, dladm_open status {}", e))
         })?;
-        let _link_id = self.create_tunnel(&handle, &desired)?;
+        let link_id = self.create_tunnel(&handle, &desired)?;
+
+        if let Some(encapsulation_limit) = desired.encapsulation_limit {
+            self.set_encapsulation_limit(&handle, link_id, encapsulation_limit)
+                .map_err(|status| {
+                    TunnelError::CreationFailed(format!(
+                        "setting encaplimit, dladm_set_linkprop status: {status}"
+                    ))
+                })?;
+        }
 
         let ip_handle = open_ipadm().map_err(|e| {
             TunnelError::CreationFailed(format!("unable to open handle, ipadm_open status {}", e))
@@ -317,35 +410,66 @@ impl TunnelBackend for IllumosBackend {
             remote_v6 = %desired.remote_v6,
             local_v4 = %desired.local_v4,
             mtu = ?desired.mtu,
+            encapsulation_limit = ?desired.encapsulation_limit,
             "tunnel established"
         );
 
         Ok(())
     }
 
-    async fn update(&self, update: TunnelUpdate) -> Result<(), TunnelError> {
-        let socket = open_inet_dgram_socket().map_err(|e| {
-            TunnelError::UpdateFailed(format!("opening interface configuration socket: {e}"))
-        })?;
-        let fd = socket.as_raw_fd();
+    async fn update(
+        &self,
+        _desired: DesiredState,
+        update: TunnelUpdate,
+    ) -> Result<(), TunnelError> {
+        if let Some(encapsulation_limit) = update.encapsulation_limit {
+            let handle = open_dladm().map_err(|status| {
+                TunnelError::UpdateFailed(format!(
+                    "opening libdladm handle, dladm_open status: {status}"
+                ))
+            })?;
+            let (link_id, status) = self.name_to_linkid(&handle);
+            if status != DLADM_STATUS_OK {
+                return Err(TunnelError::UpdateFailed(format!(
+                    "resolving link id, dladm_name2info status: {status}"
+                )));
+            }
 
-        if let Some(mtu) = update.mtu {
-            // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
-            // which accepts SIOCSLIF* ioctls.
-            unsafe { sys::set_mtu(fd, &self.cname, mtu) }
-                .map_err(|e| TunnelError::UpdateFailed(format!("setting interface MTU: {e}")))?;
+            self.set_encapsulation_limit(&handle, link_id, encapsulation_limit)
+                .map_err(|status| {
+                    TunnelError::UpdateFailed(format!(
+                        "setting encaplimit, dladm_set_linkprop status: {status}"
+                    ))
+                })?;
         }
 
-        if update.bring_up {
-            // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM `socket`,
-            // which accepts SIOCSLIF* ioctls.
-            unsafe { sys::bring_up(fd, &self.cname) }
-                .map_err(|e| TunnelError::UpdateFailed(format!("setting interface flags: {e}")))?;
+        if update.mtu.is_some() || update.bring_up {
+            let socket = open_inet_dgram_socket().map_err(|e| {
+                TunnelError::UpdateFailed(format!("opening interface configuration socket: {e}"))
+            })?;
+            let fd = socket.as_raw_fd();
+
+            if let Some(mtu) = update.mtu {
+                // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM
+                // `socket`, which accepts SIOCSLIF* ioctls.
+                unsafe { sys::set_mtu(fd, &self.cname, mtu) }.map_err(|e| {
+                    TunnelError::UpdateFailed(format!("setting interface MTU: {e}"))
+                })?;
+            }
+
+            if update.bring_up {
+                // SAFETY: `fd` belongs to the live AF_INET/SOCK_DGRAM
+                // `socket`, which accepts SIOCSLIF* ioctls.
+                unsafe { sys::bring_up(fd, &self.cname) }.map_err(|e| {
+                    TunnelError::UpdateFailed(format!("setting interface flags: {e}"))
+                })?;
+            }
         }
 
         tracing::info!(
             name = %self.cname.to_string_lossy(),
             mtu = ?update.mtu,
+            encapsulation_limit = ?update.encapsulation_limit,
             bring_up = update.bring_up,
             "interface updated"
         );
@@ -431,11 +555,13 @@ impl TunnelBackend for IllumosBackend {
         let remote_v6 = parse_tunnel_addr(&params.r_addr, "remote")?;
         let admin_up = self.is_admin_up()?;
         let mtu = self.get_mtu()?;
+        let encapsulation_limit = self.get_encapsulation_limit(&handle, params.link_id)?;
 
         Ok(Observed::Present {
             local_v6,
             remote_v6,
             mtu,
+            encapsulation_limit,
             admin_up,
         })
     }
@@ -600,6 +726,24 @@ fn parse_tunnel_addr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU8;
+
+    fn test_desired_state() -> DesiredState {
+        DesiredState {
+            local_v6: Ipv6Addr::UNSPECIFIED,
+            remote_v6: Ipv6Addr::UNSPECIFIED,
+            local_v4: Ipv4Addr::UNSPECIFIED,
+            mtu: None,
+            encapsulation_limit: None,
+        }
+    }
+
+    fn test_encapsulation_limit_value() -> u8 {
+        std::env::var("DSLITE_TEST_ENCAP_LIMIT")
+            .expect("DSLITE_TEST_ENCAP_LIMIT must contain the prepared encapsulation limit")
+            .parse()
+            .expect("DSLITE_TEST_ENCAP_LIMIT must be an integer from 0 through 255")
+    }
 
     fn c_addr(value: &str) -> [c_char; NI_MAXHOST] {
         let mut result = [0; NI_MAXHOST];
@@ -654,10 +798,14 @@ mod tests {
         let backend = IllumosBackend::new(name).unwrap();
 
         backend
-            .update(TunnelUpdate {
-                mtu: Some(mtu),
-                bring_up: false,
-            })
+            .update(
+                test_desired_state(),
+                TunnelUpdate {
+                    mtu: Some(mtu),
+                    encapsulation_limit: None,
+                    bring_up: false,
+                },
+            )
             .await
             .unwrap();
 
@@ -692,6 +840,7 @@ mod tests {
             .expect("DSLITE_TEST_MTU must contain the prepared tunnel MTU")
             .parse()
             .expect("DSLITE_TEST_MTU must be an unsigned integer");
+        let encapsulation_limit = test_encapsulation_limit_value();
         let admin_up = match expected.as_str() {
             "present-up" => true,
             "present-down" => false,
@@ -704,9 +853,45 @@ mod tests {
                 local_v6,
                 remote_v6,
                 mtu,
+                encapsulation_limit: (encapsulation_limit != 0).then_some(encapsulation_limit),
                 admin_up,
             }
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires tunnel state prepared by crates/dslite-b4/scripts/test-illumos-observe.sh"]
+    async fn sets_illumos_tunnel_encapsulation_limit() {
+        let name = std::env::var("DSLITE_TEST_TUNNEL")
+            .expect("DSLITE_TEST_TUNNEL must name the prepared test tunnel");
+        let value = test_encapsulation_limit_value();
+        let configured = match NonZeroU8::new(value) {
+            Some(value) => EncapsulationLimit::Value(value),
+            None => EncapsulationLimit::Disabled,
+        };
+        let backend = IllumosBackend::new(name).unwrap();
+
+        backend
+            .update(
+                test_desired_state(),
+                TunnelUpdate {
+                    mtu: None,
+                    encapsulation_limit: Some(configured),
+                    bring_up: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let Observed::Present {
+            encapsulation_limit,
+            ..
+        } = backend.observe().await.unwrap()
+        else {
+            panic!("prepared tunnel is absent");
+        };
+
+        assert_eq!(encapsulation_limit, (value != 0).then_some(value),);
     }
 
     #[tokio::test]
@@ -726,13 +911,18 @@ mod tests {
             .expect("DSLITE_TEST_MTU must contain the prepared tunnel MTU")
             .parse()
             .expect("DSLITE_TEST_MTU must be an unsigned integer");
+        let encapsulation_limit = test_encapsulation_limit_value();
         let backend = IllumosBackend::new(name).unwrap();
 
         backend
-            .update(TunnelUpdate {
-                mtu: None,
-                bring_up: true,
-            })
+            .update(
+                test_desired_state(),
+                TunnelUpdate {
+                    mtu: None,
+                    encapsulation_limit: None,
+                    bring_up: true,
+                },
+            )
             .await
             .unwrap();
 
@@ -742,6 +932,7 @@ mod tests {
                 local_v6,
                 remote_v6,
                 mtu,
+                encapsulation_limit: (encapsulation_limit != 0).then_some(encapsulation_limit),
                 admin_up: true,
             }
         );

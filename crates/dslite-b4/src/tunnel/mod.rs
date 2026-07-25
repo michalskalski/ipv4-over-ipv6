@@ -23,6 +23,7 @@ pub enum Observed {
         local_v6: Ipv6Addr,
         remote_v6: Ipv6Addr,
         mtu: u32,
+        encapsulation_limit: Option<u8>,
         admin_up: bool,
     },
 }
@@ -33,17 +34,19 @@ pub struct DesiredState {
     pub remote_v6: Ipv6Addr,
     pub local_v4: Ipv4Addr,
     pub mtu: Option<u32>,
+    pub encapsulation_limit: Option<EncapsulationLimit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TunnelUpdate {
     pub mtu: Option<u32>,
+    pub encapsulation_limit: Option<EncapsulationLimit>,
     pub bring_up: bool,
 }
 
 impl TunnelUpdate {
     pub(crate) fn is_empty(&self) -> bool {
-        self.mtu.is_none() && !self.bring_up
+        self.mtu.is_none() && self.encapsulation_limit.is_none() && !self.bring_up
     }
 }
 
@@ -71,7 +74,11 @@ pub enum EncapsulationLimit {
 
 pub trait TunnelBackend: Send + Sync {
     fn setup(&self, desired: DesiredState) -> impl Future<Output = Result<(), TunnelError>> + Send;
-    fn update(&self, update: TunnelUpdate) -> impl Future<Output = Result<(), TunnelError>> + Send;
+    fn update(
+        &self,
+        desired: DesiredState,
+        update: TunnelUpdate,
+    ) -> impl Future<Output = Result<(), TunnelError>> + Send;
     fn observe(&self) -> impl Future<Output = Result<Observed, TunnelError>> + Send;
     fn teardown(&self) -> impl Future<Output = Result<(), TunnelError>> + Send;
 }

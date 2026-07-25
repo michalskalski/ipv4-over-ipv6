@@ -29,32 +29,48 @@ delete_test_tunnel()
 run_observe_test()
 {
     MTU=
+    ENCAP_LIMIT=
     if [ "$1" != absent ]; then
         MTU=$(ifconfig "$TUNNEL" | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "mtu") { print $(i + 1); exit } }')
+        ENCAP_LIMIT=$(dladm show-linkprop -c -o value -p encaplimit "$TUNNEL")
     fi
     DSLITE_TEST_TUNNEL=$TUNNEL \
     DSLITE_TEST_LOCAL_V6=$LOCAL_V6 \
     DSLITE_TEST_REMOTE_V6=$REMOTE_V6 \
     DSLITE_TEST_MTU=$MTU \
+    DSLITE_TEST_ENCAP_LIMIT=$ENCAP_LIMIT \
     DSLITE_TEST_EXPECT=$1 \
-        cargo test observes_illumos_tunnel -- --ignored --nocapture
+        cargo test -p dslite-b4 --no-default-features --lib \
+        observes_illumos_tunnel -- --ignored --nocapture
 }
 
 run_bring_up_test()
 {
     MTU=$(ifconfig "$TUNNEL" | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "mtu") { print $(i + 1); exit } }')
+    ENCAP_LIMIT=$(dladm show-linkprop -c -o value -p encaplimit "$TUNNEL")
     DSLITE_TEST_TUNNEL=$TUNNEL \
     DSLITE_TEST_LOCAL_V6=$LOCAL_V6 \
     DSLITE_TEST_REMOTE_V6=$REMOTE_V6 \
     DSLITE_TEST_MTU=$MTU \
-        cargo test brings_up_illumos_tunnel -- --ignored --nocapture
+    DSLITE_TEST_ENCAP_LIMIT=$ENCAP_LIMIT \
+        cargo test -p dslite-b4 --no-default-features --lib \
+        brings_up_illumos_tunnel -- --ignored --nocapture
 }
 
 run_set_mtu_test()
 {
     DSLITE_TEST_TUNNEL=$TUNNEL \
     DSLITE_TEST_MTU=$CONFIGURED_MTU \
-        cargo test sets_illumos_tunnel_mtu -- --ignored --nocapture
+        cargo test -p dslite-b4 --no-default-features --lib \
+        sets_illumos_tunnel_mtu -- --ignored --nocapture
+}
+
+run_set_encap_limit_test()
+{
+    DSLITE_TEST_TUNNEL=$TUNNEL \
+    DSLITE_TEST_ENCAP_LIMIT=$1 \
+        cargo test -p dslite-b4 --no-default-features --lib \
+        sets_illumos_tunnel_encapsulation_limit -- --ignored --nocapture
 }
 
 trap cleanup EXIT HUP INT TERM
@@ -68,6 +84,10 @@ ipadm create-addr -t -T static \
     -a local=192.0.0.2,remote=192.0.0.1 \
     "$TUNNEL/test"
 
+run_observe_test present-up
+run_set_encap_limit_test 0
+run_observe_test present-up
+run_set_encap_limit_test 7
 run_observe_test present-up
 run_set_mtu_test
 run_observe_test present-up

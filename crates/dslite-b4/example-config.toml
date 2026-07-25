@@ -9,13 +9,17 @@ local_v4 = "192.0.0.2"
 # Optional. When omitted, the operating-system tunnel default is used.
 # mtu = 1460
 
+# Optional. When omitted, the operating system tunnel default is used.
+# Accepts an integer from 1 through 255, or "disabled".
+# encapsulation_limit = 4
+
 [aftr]
 # Optional static override. If omitted, the daemon reads runtime AFTR state.
 address = "2001:db8::2"
 
 [discovery]
-# Automatic AFTR discovery is opt-in.
-method = "none"
+# Optional. Defaults to "none". Use "hb46pp" to enable automatic discovery.
+# method = "hb46pp"
 # vendor_id = "000000"
 # product = "dslite-b4"
 

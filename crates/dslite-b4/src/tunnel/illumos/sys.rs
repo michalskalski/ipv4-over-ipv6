@@ -30,6 +30,16 @@ pub const IPTUN_PARAM_TYPE: c_uint = 0x0000_0001;
 pub const IPTUN_PARAM_LADDR: c_uint = 0x0000_0002;
 pub const IPTUN_PARAM_RADDR: c_uint = 0x0000_0004;
 
+/// `dladm_prop_type_t::DLADM_PROP_VAL_CURRENT`, request the property's
+/// currently active value.
+/// <https://github.com/illumos/illumos-gate/blob/0764e87f4a667f36d63262fcdd690064929acc48/usr/src/lib/libdladm/common/libdllink.h#L57-L63>
+pub const DLADM_PROP_VAL_CURRENT: u32 = 1;
+
+/// `DLADM_PROP_VAL_MAX`, minimum size in bytes of each property value
+/// buffer passed to `dladm_get_linkprop`.
+/// <https://github.com/illumos/illumos-gate/blob/0764e87f4a667f36d63262fcdd690064929acc48/usr/src/lib/libdladm/common/libdllink.h#L77-L82>
+pub const DLADM_PROP_VAL_MAX: usize = 128;
+
 // libipadm constants
 
 /// `ipadm_status_t::IPADM_SUCCESS`.
@@ -72,6 +82,22 @@ unsafe extern "C" {
         flags: *mut u32,
         class: *mut u32,
         media: *mut u32,
+    ) -> u32;
+    pub fn dladm_get_linkprop(
+        handle: *mut c_void,
+        link_id: u32,
+        property_type: u32,
+        property_name: *const c_char,
+        property_values: *mut *mut c_char,
+        value_count: *mut c_uint,
+    ) -> u32;
+    pub fn dladm_set_linkprop(
+        handle: *mut c_void,
+        link_id: u32,
+        property_name: *const c_char,
+        property_values: *mut *mut c_char,
+        value_count: c_uint,
+        flags: c_uint,
     ) -> u32;
 
     // libipadm: interface lifecycle (works on 64-bit; ipmgmt_if_arg_t has no size_t)
