@@ -1,3 +1,11 @@
+//! Receives routing and interface notifications from the operating system.
+//!
+//! Notifications are hints that kernel state may have changed. This module
+//! collects them for a fixed 500 millisecond window and does not decide whether
+//! reconciliation is required. The batch ends 500 milliseconds after its first
+//! notification, even if more notifications continue arriving. This prevents a
+//! busy event stream from delaying the relevance check indefinitely.
+
 #[cfg(target_os = "linux")]
 use futures_util::StreamExt;
 #[cfg(target_os = "linux")]
@@ -21,8 +29,11 @@ use tokio::io::{Interest, unix::AsyncFd};
 
 #[cfg(target_os = "illumos")]
 use crate::tunnel::illumos::{
-    RTM_ADD, RTM_CHGADDR, RTM_DELADDR, RTM_DELETE, RTM_FREEADDR, RTM_NEWADDR, rt_msghdr,
+    RTM_ADD, RTM_CHANGE, RTM_CHGADDR, RTM_DELADDR, RTM_DELETE, RTM_FREEADDR, RTM_IFINFO,
+    RTM_NEWADDR, rt_msghdr,
 };
+
+const NETWORK_EVENT_BATCH_WINDOW: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "linux")]
 pub struct NetworkChanges {
@@ -40,25 +51,42 @@ impl NetworkChanges {
             MulticastGroup::Link,
             MulticastGroup::Ipv6Ifaddr,
             MulticastGroup::Ipv6Route,
+            MulticastGroup::Ipv6Rule,
         ])?;
         let task = tokio::spawn(connection);
         Ok(Self { messages, task })
     }
 
-    pub async fn changed(&mut self) -> anyhow::Result<()> {
-        let Some((_message, _)) = self.messages.next().await else {
-            return Err(anyhow::anyhow!("network-change event stream ended"));
+    pub async fn next_batch(&mut self) -> anyhow::Result<()> {
+        let Some((message, _)) = self.messages.next().await else {
+            return Err(anyhow::anyhow!("network change event stream ended"));
         };
+        tracing::trace!(
+            payload = ?message.payload,
+            "network event received"
+        );
 
         let mut count = 1;
 
-        while let Ok(Some((_, _))) =
-            tokio::time::timeout(Duration::from_millis(100), self.messages.next()).await
-        {
-            count += 1;
+        let batch_deadline = tokio::time::Instant::now() + NETWORK_EVENT_BATCH_WINDOW;
+
+        loop {
+            match tokio::time::timeout_at(batch_deadline, self.messages.next()).await {
+                Ok(Some((message, _))) => {
+                    tracing::trace!(
+                        payload = ?message.payload,
+                        "network event received"
+                    );
+                    count += 1;
+                }
+                Ok(None) => {
+                    return Err(anyhow::anyhow!("network change event stream ended"));
+                }
+                Err(_) => break,
+            }
         }
 
-        tracing::debug!(count, "network-change hints received");
+        tracing::debug!(count, "network change hints received");
         Ok(())
     }
 }
@@ -100,17 +128,16 @@ impl NetworkChanges {
         })
     }
 
-    pub async fn changed(&mut self) -> anyhow::Result<()> {
+    pub async fn next_batch(&mut self) -> anyhow::Result<()> {
         self.read_next_wake_hint().await?;
+        let batch_deadline = tokio::time::Instant::now() + NETWORK_EVENT_BATCH_WINDOW;
 
         let mut count = 1;
 
         // Drain raw route messages, not just wake-worthy ones.
         // Disallowed messages can sit between useful hints in the same PF_ROUTE burst.
         loop {
-            match tokio::time::timeout(Duration::from_millis(100), self.read_next_route_message())
-                .await
-            {
+            match tokio::time::timeout_at(batch_deadline, self.read_next_route_message()).await {
                 Ok(Ok(Some(msg_type))) if is_wake_route_type(msg_type) => {
                     count += 1;
                 }
@@ -121,7 +148,7 @@ impl NetworkChanges {
                 Err(_elapsed) => break,
             }
         }
-        tracing::debug!(count, "network-change hints received");
+        tracing::debug!(count, "network change hints received");
         Ok(())
     }
 
@@ -191,6 +218,13 @@ fn read_route_hint(fd: RawFd) -> io::Result<Option<u8>> {
 fn is_wake_route_type(msg_type: u8) -> bool {
     matches!(
         msg_type,
-        RTM_ADD | RTM_DELETE | RTM_NEWADDR | RTM_DELADDR | RTM_CHGADDR | RTM_FREEADDR
+        RTM_ADD
+            | RTM_DELETE
+            | RTM_CHANGE
+            | RTM_NEWADDR
+            | RTM_DELADDR
+            | RTM_IFINFO
+            | RTM_CHGADDR
+            | RTM_FREEADDR
     )
 }

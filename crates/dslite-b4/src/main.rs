@@ -8,8 +8,9 @@ use dslite_b4::{
     aftr::AftrSelector,
     aftr_discovery::DiscoveryRuntime,
     config::{AftrAddress, Config},
+    discovery::discover_local_v6,
     dns::resolve_aftr_addresses,
-    lifecycle::{Desired, reconcile_once},
+    lifecycle::{self, Desired, reconcile_once},
     network_changes::NetworkChanges,
     runtime_state::{
         self, PidFile, clear_provided_aftr, signal_daemon_refresh, write_provided_aftr,
@@ -126,7 +127,7 @@ async fn run<B: TunnelBackend>(
     let mut network_changes = NetworkChanges::new()?;
     let mut aftr_selector = AftrSelector::new();
     let mut attempt: u64 = 0;
-    loop {
+    'reconcile: loop {
         let observed = backend.observe().await?;
         let current_aftr = current_aftr(&observed);
         let computation =
@@ -160,15 +161,35 @@ async fn run<B: TunnelBackend>(
             "waiting for next reconciliation"
         );
 
-        tokio::select! {
-            _ = tokio::time::sleep_until(scheduled.at.into()) => {},
-            result = network_changes.changed() => { result?; }
-            _ = sigusr1.recv() => {
-                tracing::debug!("runtime state refresh requested");
-                attempt = 0;
-            },
-            _ = signal::ctrl_c() => break,
-            _ = sigterm.recv() => break,
+        // Keep waiting for the original absolute deadline after an irrelevant
+        // batch so event noise cannot postpone scheduled reconciliation.
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(scheduled.at.into()) => break,
+                result = network_changes.next_batch() => {
+                    result?;
+
+                    if network_change_requires_reconciliation(
+                        &backend,
+                        &computation.desired,
+                        config.tunnel.local_v6.is_none(),
+                    )
+                    .await?
+                    {
+                        tracing::debug!("network change requires reconciliation");
+                        break;
+                    }
+
+                    tracing::trace!("network change does not require reconciliation");
+                }
+                _ = sigusr1.recv() => {
+                    tracing::debug!("runtime state refresh requested");
+                    attempt = 0;
+                    break;
+                },
+                _ = signal::ctrl_c() => break 'reconcile,
+                _ = sigterm.recv() => break 'reconcile,
+            }
         }
     }
 
@@ -288,10 +309,72 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
     toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
 }
 
+/// Checks whether network notifications justify a full reconciliation pass.
+///
+/// Tunnel drift always requires reconciliation. When the local IPv6 address
+/// is selected automatically, a changed kernel source address also requires
+/// reconciliation. A source selection failure is treated conservatively.
+async fn network_change_requires_reconciliation<B: TunnelBackend>(
+    backend: &B,
+    desired: &Desired,
+    local_v6_is_automatic: bool,
+) -> anyhow::Result<bool> {
+    let Desired::Resolved(desired_state) = desired else {
+        return Ok(true);
+    };
+    let observed = backend.observe().await?;
+
+    if !matches!(lifecycle::plan(&observed, desired), lifecycle::Plan::Noop) {
+        return Ok(true);
+    }
+
+    if !local_v6_is_automatic {
+        return Ok(false);
+    }
+
+    match discover_local_v6(desired_state.remote_v6) {
+        Ok(local_v6) => Ok(local_v6 != desired_state.local_v6),
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "local IPv6 selection unavailable after network change"
+            );
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dslite_b4::tunnel::{TunnelError, TunnelUpdate};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    struct FakeBackend {
+        observed: Observed,
+    }
+
+    impl TunnelBackend for FakeBackend {
+        async fn setup(&self, _desired: DesiredState) -> Result<(), TunnelError> {
+            unreachable!()
+        }
+
+        async fn update(
+            &self,
+            _desired: DesiredState,
+            _update: TunnelUpdate,
+        ) -> Result<(), TunnelError> {
+            unreachable!()
+        }
+
+        async fn observe(&self) -> Result<Observed, TunnelError> {
+            Ok(self.observed)
+        }
+
+        async fn teardown(&self) -> Result<(), TunnelError> {
+            unreachable!()
+        }
+    }
 
     fn test_desired_state() -> DesiredState {
         DesiredState {
@@ -344,5 +427,53 @@ mod tests {
         for (name, computation, expected) in cases {
             assert_eq!(computation.wake_hint, expected, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn network_change_reconciles_when_desired_is_unavailable() {
+        let backend = FakeBackend {
+            observed: Observed::Absent,
+        };
+
+        assert!(
+            network_change_requires_reconciliation(&backend, &Desired::Unavailable, false)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_reconciles_tunnel_drift() {
+        let backend = FakeBackend {
+            observed: Observed::Absent,
+        };
+        let desired = Desired::Resolved(test_desired_state());
+
+        assert!(
+            network_change_requires_reconciliation(&backend, &desired, false)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_ignores_matching_tunnel_with_explicit_local_v6() {
+        let desired_state = test_desired_state();
+        let backend = FakeBackend {
+            observed: Observed::Present {
+                local_v6: desired_state.local_v6,
+                remote_v6: desired_state.remote_v6,
+                mtu: 1452,
+                encapsulation_limit: None,
+                admin_up: true,
+            },
+        };
+        let desired = Desired::Resolved(desired_state);
+
+        assert!(
+            !network_change_requires_reconciliation(&backend, &desired, false)
+                .await
+                .unwrap()
+        );
     }
 }

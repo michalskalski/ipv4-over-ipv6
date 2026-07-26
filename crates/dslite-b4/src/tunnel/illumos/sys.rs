@@ -586,8 +586,10 @@ pub unsafe fn get_mtu(sock_fd: c_int, name: &CStr) -> io::Result<u32> {
 pub const RTM_VERSION: c_uchar = 3;
 pub const RTM_ADD: c_uchar = 0x1;
 pub const RTM_DELETE: c_uchar = 0x2;
+pub const RTM_CHANGE: c_uchar = 0x3;
 pub const RTM_NEWADDR: c_uchar = 0xc;
 pub const RTM_DELADDR: c_uchar = 0xd;
+pub const RTM_IFINFO: c_uchar = 0xe;
 pub const RTM_CHGADDR: c_uchar = 0xf;
 pub const RTM_FREEADDR: c_uchar = 0x10;
 

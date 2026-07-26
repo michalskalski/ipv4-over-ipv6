@@ -20,7 +20,10 @@ pub enum Plan {
     Noop,
 }
 
-fn decide(observed: &Observed, desired: &Desired) -> Plan {
+/// Computes the action needed to make observed tunnel state match desired state.
+///
+/// This function only compares state. It does not modify the tunnel.
+pub fn plan(observed: &Observed, desired: &Desired) -> Plan {
     // no desired state - keep
     let Desired::Resolved(desired) = desired else {
         return Plan::Keep;
@@ -72,7 +75,7 @@ pub async fn reconcile_once<B: TunnelBackend>(
     observed: &Observed,
     desired: &Desired,
 ) -> Result<Plan, TunnelError> {
-    let action = decide(observed, desired);
+    let action = plan(observed, desired);
 
     match action {
         Plan::Create(state) => backend.setup(state).await?,
@@ -307,7 +310,7 @@ mod tests {
 
     #[test]
     fn keep_when_observed_absent_and_desired_unavailable() {
-        let action = decide(&Observed::Absent, &Desired::Unavailable);
+        let action = plan(&Observed::Absent, &Desired::Unavailable);
         assert_eq!(action, Plan::Keep)
     }
 
@@ -321,7 +324,7 @@ mod tests {
             encapsulation_limit: None,
             admin_up: true,
         };
-        let action = decide(&observed, &Desired::Unavailable);
+        let action = plan(&observed, &Desired::Unavailable);
         assert_eq!(action, Plan::Keep)
     }
 
@@ -329,7 +332,7 @@ mod tests {
     fn create_when_observed_absent_and_desired_resolved() {
         let desired = desired(Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED);
 
-        let action = decide(&Observed::Absent, &desired);
+        let action = plan(&Observed::Absent, &desired);
 
         let Desired::Resolved(state) = desired else {
             unreachable!();
@@ -350,7 +353,7 @@ mod tests {
         };
         let desired = desired(local_v6, remote_v6);
 
-        let action = decide(&observed, &desired);
+        let action = plan(&observed, &desired);
 
         assert_eq!(action, Plan::Noop)
     }
@@ -374,7 +377,7 @@ mod tests {
             encapsulation_limit: None,
         });
 
-        let action = decide(&observed, &desired);
+        let action = plan(&observed, &desired);
 
         assert_eq!(action, Plan::Noop)
     }
@@ -398,7 +401,7 @@ mod tests {
             encapsulation_limit: None,
         });
 
-        let action = decide(&observed, &desired);
+        let action = plan(&observed, &desired);
 
         let update = TunnelUpdate {
             mtu: Some(1360),
@@ -427,7 +430,7 @@ mod tests {
         };
         let desired = desired(local_v6, remote_v6);
 
-        let action = decide(&observed, &desired);
+        let action = plan(&observed, &desired);
 
         assert_eq!(
             action,
@@ -483,7 +486,7 @@ mod tests {
                 encapsulation_limit: desired_limit,
             });
 
-            let action = decide(&observed, &desired);
+            let action = plan(&observed, &desired);
             let expected = match expected_update {
                 Some(encapsulation_limit) => Plan::Update {
                     desired: resolved_state(desired),
@@ -512,7 +515,7 @@ mod tests {
         };
         let desired = desired(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), remote_v6);
 
-        let action = decide(&observed, &desired);
+        let action = plan(&observed, &desired);
 
         let Desired::Resolved(state) = desired else {
             unreachable!();
@@ -532,7 +535,7 @@ mod tests {
         };
         let desired = desired(local_v6, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
 
-        let action = decide(&observed, &desired);
+        let action = plan(&observed, &desired);
 
         let Desired::Resolved(state) = desired else {
             unreachable!();
