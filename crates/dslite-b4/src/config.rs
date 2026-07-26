@@ -19,7 +19,10 @@ pub struct Config {
 
 #[derive(Deserialize, Debug)]
 pub struct TunnelConfig {
-    #[serde(default = "default_tunnel_name")]
+    #[serde(
+        default = "default_tunnel_name",
+        deserialize_with = "deserialize_tunnel_name"
+    )]
     pub name: String,
     pub local_v6: Option<Ipv6Addr>,
     #[serde(
@@ -49,6 +52,74 @@ where
         )));
     }
     Ok(addr)
+}
+
+fn deserialize_tunnel_name<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let name = String::deserialize(d)?;
+
+    validate_tunnel_name(&name).map_err(serde::de::Error::custom)?;
+
+    Ok(name)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_tunnel_name(name: &str) -> Result<(), &'static str> {
+    if !(1..=15).contains(&name.len()) {
+        return Err("must contain from 1 through 15 bytes");
+    }
+
+    if matches!(name, "." | "..") {
+        return Err("cannot be '.' or '..'");
+    }
+
+    if name
+        .bytes()
+        .any(|byte| matches!(byte, b'\0' | b'/' | b':' | b'%') || byte.is_ascii_whitespace())
+    {
+        return Err("cannot contain NUL, '/', ':', '%', or whitespace");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "illumos")]
+fn validate_tunnel_name(name: &str) -> Result<(), &'static str> {
+    if !(1..=31).contains(&name.len()) {
+        return Err("must contain from 1 through 31 bytes");
+    }
+
+    let bytes = name.as_bytes();
+
+    if bytes[0].is_ascii_digit() {
+        return Err("cannot start with a digit");
+    }
+
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+    {
+        return Err("can contain only letters, digits, '_', and '.'");
+    }
+
+    let suffix_len = bytes
+        .iter()
+        .rev()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+
+    if suffix_len == 0 {
+        return Err("must end with a numeric suffix");
+    }
+
+    let suffix_start = bytes.len() - suffix_len;
+    if suffix_len > 1 && bytes[suffix_start] == b'0' {
+        return Err("numeric suffix cannot have a leading zero");
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -233,6 +304,74 @@ mod tests {
 
         for input in cases {
             assert!(toml::from_str::<TunnelConfig>(input).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_valid_linux_tunnel_names() {
+        let cases = [
+            "dslite0",
+            "dslite-evt",
+            "0dslite",
+            "dslite_0",
+            "abcdefghijklmn0",
+        ];
+
+        for name in cases {
+            let input = format!(r#"name = "{name}""#);
+            let config: TunnelConfig = toml::from_str(&input).unwrap();
+
+            assert_eq!(config.name, name);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_invalid_linux_tunnel_names() {
+        let cases = [
+            "",
+            ".",
+            "..",
+            "abcdefghijklmnop",
+            "dslite/0",
+            "dslite:0",
+            "dslite 0",
+            "dslite%d",
+        ];
+
+        for name in cases {
+            let input = format!(r#"name = "{name}""#);
+
+            assert!(
+                toml::from_str::<TunnelConfig>(&input).is_err(),
+                "invalid name accepted: {name:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "illumos")]
+    #[test]
+    fn validates_illumos_tunnel_names() {
+        let cases = [
+            ("dslite0".to_string(), true),
+            ("dslite10".to_string(), true),
+            ("dslite_0".to_string(), true),
+            ("dslite.0".to_string(), true),
+            (format!("{}0", "a".repeat(30)), true),
+            ("".to_string(), false),
+            ("0dslite0".to_string(), false),
+            ("dslite".to_string(), false),
+            ("dslite01".to_string(), false),
+            ("dslite-0".to_string(), false),
+            (format!("{}0", "a".repeat(31)), false),
+        ];
+
+        for (name, expected_valid) in cases {
+            let input = format!(r#"name = "{name}""#);
+            let valid = toml::from_str::<TunnelConfig>(&input).is_ok();
+
+            assert_eq!(valid, expected_valid, "name: {name:?}");
         }
     }
 }
