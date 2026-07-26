@@ -1,26 +1,65 @@
-use std::fmt;
+//! Discovers an AFTR and retains protocol results in memory.
+//!
+//! A retained result may contain an AFTR, a negative result, or a retryable
+//! error. Every retained result has a next attempt time. Reconciliation may
+//! still run before that time, but it reuses the retained result instead of
+//! starting another provisioning request.
+
+use std::{fmt, time::Instant};
+
 #[cfg(feature = "hb46pp")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(feature = "hb46pp")]
 use anyhow::Context;
 
 use crate::config::{AftrAddress, DiscoveryConfig, DiscoveryMethod};
 
-#[cfg(feature = "hb46pp")]
+/// The AFTR discovered during one attempt and its next protocol deadline.
+///
+/// A missing AFTR may be a retained negative result. In that case
+/// `next_attempt_at` prevents unrelated wake events from causing an early
+/// provisioning attempt.
 #[derive(Debug)]
-struct ActiveProvisioning {
+pub struct DiscoveryOutput {
     aftr: Option<AftrAddress>,
-    refresh_at: Instant,
+    next_attempt_at: Option<Instant>,
 }
 
-#[cfg(feature = "hb46pp")]
-impl ActiveProvisioning {
-    fn is_fresh(&self, now: Instant) -> bool {
-        now < self.refresh_at
+impl DiscoveryOutput {
+    fn new(aftr: Option<AftrAddress>, next_attempt_at: Option<Instant>) -> Self {
+        Self {
+            aftr,
+            next_attempt_at,
+        }
+    }
+
+    /// Returns the discovered AFTR and the selected time for the next attempt.
+    pub fn into_parts(self) -> (Option<AftrAddress>, Option<Instant>) {
+        (self.aftr, self.next_attempt_at)
     }
 }
 
+#[cfg(feature = "hb46pp")]
+/// A discovery result retained until another provisioning attempt is allowed.
+#[derive(Debug)]
+struct RetainedDiscovery {
+    aftr: Option<AftrAddress>,
+    next_attempt_at: Instant,
+}
+
+#[cfg(feature = "hb46pp")]
+impl RetainedDiscovery {
+    fn is_active(&self, now: Instant) -> bool {
+        now < self.next_attempt_at
+    }
+
+    fn output(&self) -> DiscoveryOutput {
+        DiscoveryOutput::new(self.aftr.clone(), Some(self.next_attempt_at))
+    }
+}
+
+/// Runs configured AFTR discovery and retains state between attempts.
 pub struct DiscoveryRuntime {
     kind: DiscoveryRuntimeKind,
 }
@@ -35,30 +74,32 @@ enum DiscoveryRuntimeKind {
 struct Hb46ppRuntime {
     request: hb46pp::ProvisioningRequest,
     client: hb46pp::client::DefaultClient,
-    active: Option<ActiveProvisioning>,
+    retained: Option<RetainedDiscovery>,
 }
 
 #[cfg(feature = "hb46pp")]
 impl Hb46ppRuntime {
-    async fn discover_aftr(&mut self) -> anyhow::Result<Option<AftrAddress>> {
+    async fn discover_aftr(&mut self) -> anyhow::Result<DiscoveryOutput> {
         let now = Instant::now();
-        if let Some(cached) = self.active.as_ref()
-            && cached.is_fresh(now)
-        {
-            tracing::debug!(
-                refresh_in_secs = cached.refresh_at.duration_since(now).as_secs(),
-                aftr = ?cached.aftr,
-                "reusing active HB46PP provisioning result"
-            );
-            return Ok(cached.aftr.clone());
+        if let Some(retained) = self.retained.as_ref() {
+            if retained.is_active(now) {
+                tracing::debug!(
+                    next_attempt_in_secs =
+                        retained.next_attempt_at.duration_since(now).as_secs(),
+                    aftr = ?retained.aftr,
+                    "reusing retained HB46PP discovery result"
+                );
+                return Ok(retained.output());
+            }
+
+            self.retained = None;
         }
 
         tracing::debug!("starting HB46PP provisioning attempt");
-        let outcome = self
-            .client
-            .provision(&self.request)
-            .await
-            .context("HB46PP provisioning failed")?;
+        let outcome = match self.client.provision(&self.request).await {
+            Ok(outcome) => outcome,
+            Err(error) => return self.handle_provisioning_error(error),
+        };
         let next_attempt_after = choose_next_attempt_delay(outcome.next_attempt_window());
 
         match outcome {
@@ -71,19 +112,37 @@ impl Hb46ppRuntime {
                     "HB46PP bootstrap record not found"
                 );
 
-                // Retain negative discovery so network-change hints do not bypass
+                // Retain negative discovery so network change hints do not bypass
                 // the protocol retry window.
-                self.store_active(None, next_attempt_after);
-                Ok(None)
+                Ok(self.retain(None, next_attempt_after))
             }
         }
+    }
+
+    fn handle_provisioning_error(
+        &mut self,
+        error: hb46pp::client::ClientError,
+    ) -> anyhow::Result<DiscoveryOutput> {
+        let Some(window) = error.next_attempt_window() else {
+            return Err(error).context("HB46PP provisioning failed");
+        };
+
+        let retry_after = choose_next_attempt_delay(window);
+
+        tracing::warn!(
+            error = %error,
+            retry_after_secs = retry_after.as_secs(),
+            "HB46PP provisioning failed, retry deferred"
+        );
+
+        Ok(self.retain(None, retry_after))
     }
 
     fn apply_response(
         &mut self,
         response: hb46pp::client::ProvisioningResponse,
         next_attempt_after: Duration,
-    ) -> anyhow::Result<Option<AftrAddress>> {
+    ) -> anyhow::Result<DiscoveryOutput> {
         tracing::debug!(
             ttl_secs = ?response.data().ttl().map(|ttl| ttl.as_secs()),
             cache_control = ?response.cache_control(),
@@ -109,16 +168,23 @@ impl Hb46ppRuntime {
         );
 
         // Cache-Control no-store prohibits persistence, not retaining the
-        // active provisioning state in memory.
-        self.store_active(aftr.clone(), next_attempt_after);
-        Ok(aftr)
+        // provisioning result in memory.
+        Ok(self.retain(aftr, next_attempt_after))
     }
 
-    fn store_active(&mut self, aftr: Option<AftrAddress>, refresh_after: Duration) {
-        self.active = Some(ActiveProvisioning {
+    fn retain(
+        &mut self,
+        aftr: Option<AftrAddress>,
+        next_attempt_after: Duration,
+    ) -> DiscoveryOutput {
+        let retained = RetainedDiscovery {
             aftr,
-            refresh_at: Instant::now() + refresh_after,
-        });
+            next_attempt_at: Instant::now() + next_attempt_after,
+        };
+        let output = retained.output();
+
+        self.retained = Some(retained);
+        output
     }
 }
 
@@ -129,12 +195,12 @@ impl fmt::Debug for DiscoveryRuntime {
             #[cfg(feature = "hb46pp")]
             DiscoveryRuntimeKind::Hb46pp(runtime) => {
                 let Hb46ppRuntime {
-                    request, active, ..
+                    request, retained, ..
                 } = runtime.as_ref();
 
                 f.debug_struct("Hb46pp")
                     .field("request", request)
-                    .field("active", active)
+                    .field("retained", retained)
                     .finish_non_exhaustive()
             }
         }
@@ -142,6 +208,7 @@ impl fmt::Debug for DiscoveryRuntime {
 }
 
 impl DiscoveryRuntime {
+    /// Validates that the selected discovery method is available and configured.
     pub fn validate_config(config: &DiscoveryConfig) -> anyhow::Result<()> {
         match config.method {
             DiscoveryMethod::None => Ok(()),
@@ -149,6 +216,7 @@ impl DiscoveryRuntime {
         }
     }
 
+    /// Creates discovery state from the validated daemon configuration.
     pub fn from_config(config: &DiscoveryConfig) -> anyhow::Result<Self> {
         match config.method {
             DiscoveryMethod::None => Ok(Self {
@@ -181,7 +249,7 @@ impl DiscoveryRuntime {
             kind: DiscoveryRuntimeKind::Hb46pp(Box::new(Hb46ppRuntime {
                 request,
                 client,
-                active: None,
+                retained: None,
             })),
         })
     }
@@ -191,11 +259,12 @@ impl DiscoveryRuntime {
         anyhow::bail!("HB46PP support is not included in this build")
     }
 
-    pub async fn discover_aftr(&mut self) -> anyhow::Result<Option<AftrAddress>> {
+    /// Discovers an AFTR or returns a retained result that is still active.
+    pub async fn discover_aftr(&mut self) -> anyhow::Result<DiscoveryOutput> {
         match &mut self.kind {
             DiscoveryRuntimeKind::None => {
                 tracing::debug!("automatic AFTR discovery is disabled");
-                Ok(None)
+                Ok(DiscoveryOutput::new(None, None))
             }
             #[cfg(feature = "hb46pp")]
             DiscoveryRuntimeKind::Hb46pp(runtime) => runtime.discover_aftr().await,
@@ -255,15 +324,15 @@ mod tests {
 
     #[cfg(feature = "hb46pp")]
     #[test]
-    fn active_provisioning_expires_at_refresh_deadline() {
+    fn retained_discovery_expires_at_next_attempt_deadline() {
         let now = Instant::now();
-        let active = ActiveProvisioning {
+        let retained = RetainedDiscovery {
             aftr: None,
-            refresh_at: now + Duration::from_secs(1),
+            next_attempt_at: now + Duration::from_secs(1),
         };
 
-        assert!(active.is_fresh(now));
-        assert!(!active.is_fresh(active.refresh_at));
+        assert!(retained.is_active(now));
+        assert!(!retained.is_active(retained.next_attempt_at));
     }
 
     #[cfg(not(feature = "hb46pp"))]
