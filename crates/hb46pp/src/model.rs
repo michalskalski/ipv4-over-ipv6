@@ -860,6 +860,13 @@ impl ProvisioningRequest {
         self.token.as_ref().map(Token::as_str)
     }
 
+    /// Sets the token sent with subsequent provisioning requests.
+    ///
+    /// Passing `None` stops sending the current token.
+    pub fn set_token(&mut self, token: Option<Token>) {
+        self.token = token;
+    }
+
     /// Returns the credentials to send with this request, if present.
     pub fn credentials(&self) -> Option<&Credentials> {
         self.credentials.as_ref()
@@ -1716,5 +1723,17 @@ mod tests {
         let error = Bootstrap::parse("v=v6mig-1 url=https://192.0.2.1/provision t=b").unwrap_err();
 
         assert!(matches!(error, BootstrapError::Ipv4EndpointNotAllowed));
+    }
+
+    #[test]
+    fn sets_and_clears_provisioning_request_token() {
+        let mut request = valid_request();
+        assert_eq!(request.token(), None);
+
+        request.set_token(Some(TOKEN.parse().unwrap()));
+        assert_eq!(request.token(), Some(TOKEN));
+
+        request.set_token(None);
+        assert_eq!(request.token(), None);
     }
 }
