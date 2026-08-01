@@ -6,7 +6,7 @@ use dslite_b4::tunnel::illumos::IllumosBackend;
 use dslite_b4::tunnel::linux::LinuxBackend;
 use dslite_b4::{
     aftr::AftrSelector,
-    aftr_discovery::DiscoveryRuntime,
+    aftr_discovery::{DiscoveryRuntime, DiscoveryState},
     config::{AftrAddress, Config},
     discovery::discover_local_v6,
     dns::resolve_aftr_addresses,
@@ -101,6 +101,13 @@ impl DesiredComputation {
         Self {
             desired: Desired::Unavailable,
             wake_hint: wake_hint_for_deadline(next_attempt_at, WakeHint::GenericRetry),
+        }
+    }
+
+    fn absent(next_attempt_at: Option<Instant>) -> Self {
+        Self {
+            desired: Desired::Absent,
+            wake_hint: wake_hint_for_deadline(next_attempt_at, WakeHint::None),
         }
     }
 }
@@ -211,13 +218,25 @@ async fn compute_desired(
     current_aftr: Option<std::net::Ipv6Addr>,
 ) -> anyhow::Result<DesiredComputation> {
     let (aftr, next_attempt_at) = match effective_aftr(config)? {
-        Some(aftr) => (Some(aftr), None),
+        Some(aftr) => (aftr, None),
 
         None => {
             tracing::debug!("no static or externally provided AFTR, trying automatic discovery");
 
             match discovery.discover_aftr().await {
-                Ok(output) => output.into_parts(),
+                Ok(output) => {
+                    let (state, next_attempt) = output.into_parts();
+                    match state {
+                        DiscoveryState::Available(aftr) => (aftr, next_attempt),
+                        DiscoveryState::Unavailable => {
+                            return Ok(DesiredComputation::unavailable(next_attempt));
+                        }
+                        DiscoveryState::NoService => {
+                            tracing::debug!("automatic AFTR discovery reported no service");
+                            return Ok(DesiredComputation::absent(next_attempt));
+                        }
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         error = %error, "automatic AFTR discovery unavailable"
@@ -227,11 +246,6 @@ async fn compute_desired(
                 }
             }
         }
-    };
-
-    let Some(aftr) = aftr else {
-        tracing::debug!("no AFTR source available");
-        return Ok(DesiredComputation::unavailable(next_attempt_at));
     };
     let aftr_candidates = match resolve_aftr_addresses(&aftr).await {
         Ok(addrs) => {
@@ -406,6 +420,16 @@ mod tests {
                 "resolved state with expired deadline",
                 DesiredComputation::resolved(test_desired_state(), Some(expired_deadline)),
                 WakeHint::None,
+            ),
+            (
+                "absent without protocol deadline",
+                DesiredComputation::absent(None),
+                WakeHint::None,
+            ),
+            (
+                "absent with protocol deadline",
+                DesiredComputation::absent(Some(deadline)),
+                WakeHint::Deadline(deadline),
             ),
             (
                 "unavailable without protocol deadline",

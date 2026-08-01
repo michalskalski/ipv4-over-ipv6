@@ -5,6 +5,7 @@ use crate::tunnel::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Desired {
     Resolved(DesiredState),
+    Absent,
     Unavailable,
 }
 
@@ -16,6 +17,7 @@ pub enum Plan {
         changes: TunnelUpdate,
     },
     Rebuild(DesiredState),
+    Teardown,
     Keep,
     Noop,
 }
@@ -24,9 +26,15 @@ pub enum Plan {
 ///
 /// This function only compares state. It does not modify the tunnel.
 pub fn plan(observed: &Observed, desired: &Desired) -> Plan {
-    // no desired state - keep
-    let Desired::Resolved(desired) = desired else {
-        return Plan::Keep;
+    let desired = match desired {
+        Desired::Resolved(desired) => desired,
+        Desired::Absent => {
+            return match observed {
+                Observed::Present { .. } => Plan::Teardown,
+                Observed::Absent => Plan::Noop,
+            };
+        }
+        Desired::Unavailable => return Plan::Keep,
     };
 
     // tunnel absent - create
@@ -84,6 +92,7 @@ pub async fn reconcile_once<B: TunnelBackend>(
             backend.teardown().await?;
             backend.setup(state).await?;
         }
+        Plan::Teardown => backend.teardown().await?,
         Plan::Keep | Plan::Noop => {}
     }
 
@@ -306,6 +315,32 @@ mod tests {
 
         assert_eq!(action, Plan::Keep);
         assert_eq!(calls(&backend), [Call::Observe]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_tears_down_tunnel_when_desired_is_absent() {
+        let backend = fake(Observed::Present {
+            local_v6: Ipv6Addr::LOCALHOST,
+            remote_v6: Ipv6Addr::UNSPECIFIED,
+            mtu: 1460,
+            encapsulation_limit: None,
+            admin_up: true,
+        });
+        let observed = backend.observe().await.unwrap();
+
+        let action = reconcile_once(&backend, &observed, &Desired::Absent)
+            .await
+            .unwrap();
+
+        assert_eq!(action, Plan::Teardown);
+        assert_eq!(calls(&backend), [Call::Observe, Call::Teardown]);
+    }
+
+    #[test]
+    fn noop_when_observed_and_desired_are_absent() {
+        let action = plan(&Observed::Absent, &Desired::Absent);
+
+        assert_eq!(action, Plan::Noop);
     }
 
     #[test]

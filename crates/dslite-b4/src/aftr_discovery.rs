@@ -15,28 +15,39 @@ use anyhow::Context;
 
 use crate::config::{AftrAddress, DiscoveryConfig, DiscoveryMethod};
 
-/// The AFTR discovered during one attempt and its next protocol deadline.
+/// The current result of automatic AFTR discovery.
+#[derive(Debug, Clone)]
+pub enum DiscoveryState {
+    /// An AFTR is available from automatic discovery.
+    Available(AftrAddress),
+    /// Automatic discovery authoritatively reported no service.
+    NoService,
+    /// Automatic discovery cannot provide an authoritative result.
+    Unavailable,
+}
+
+/// An automatic discovery result and its next protocol deadline.
 ///
-/// A missing AFTR may be a retained negative result. In that case
-/// `next_attempt_at` prevents unrelated wake events from causing an early
-/// provisioning attempt.
+/// A no-service or unavailable result may be retained. In that case,
+/// `next_attempt_at` prevents unrelated wake events from starting another
+/// provisioning attempt early.
 #[derive(Debug)]
 pub struct DiscoveryOutput {
-    aftr: Option<AftrAddress>,
+    state: DiscoveryState,
     next_attempt_at: Option<Instant>,
 }
 
 impl DiscoveryOutput {
-    fn new(aftr: Option<AftrAddress>, next_attempt_at: Option<Instant>) -> Self {
+    fn new(state: DiscoveryState, next_attempt_at: Option<Instant>) -> Self {
         Self {
-            aftr,
+            state,
             next_attempt_at,
         }
     }
 
-    /// Returns the discovered AFTR and the selected time for the next attempt.
-    pub fn into_parts(self) -> (Option<AftrAddress>, Option<Instant>) {
-        (self.aftr, self.next_attempt_at)
+    /// Returns the discovery state and selected time for the next attempt.
+    pub fn into_parts(self) -> (DiscoveryState, Option<Instant>) {
+        (self.state, self.next_attempt_at)
     }
 }
 
@@ -44,7 +55,7 @@ impl DiscoveryOutput {
 /// A discovery result retained until another provisioning attempt is allowed.
 #[derive(Debug)]
 struct RetainedDiscovery {
-    aftr: Option<AftrAddress>,
+    state: DiscoveryState,
     next_attempt_at: Instant,
 }
 
@@ -55,7 +66,7 @@ impl RetainedDiscovery {
     }
 
     fn output(&self) -> DiscoveryOutput {
-        DiscoveryOutput::new(self.aftr.clone(), Some(self.next_attempt_at))
+        DiscoveryOutput::new(self.state.clone(), Some(self.next_attempt_at))
     }
 }
 
@@ -86,7 +97,7 @@ impl Hb46ppRuntime {
                 tracing::debug!(
                     next_attempt_in_secs =
                         retained.next_attempt_at.duration_since(now).as_secs(),
-                    aftr = ?retained.aftr,
+                    state = ?retained.state,
                     "reusing retained HB46PP discovery result"
                 );
                 return Ok(retained.output());
@@ -112,9 +123,9 @@ impl Hb46ppRuntime {
                     "HB46PP bootstrap record not found"
                 );
 
-                // Retain negative discovery so network change hints do not bypass
-                // the protocol retry window.
-                Ok(self.retain(None, next_attempt_after))
+                // Retain the authoritative no-service result so network change hints
+                // do not bypass the protocol retry window.
+                Ok(self.retain(DiscoveryState::NoService, next_attempt_after))
             }
         }
     }
@@ -123,19 +134,26 @@ impl Hb46ppRuntime {
         &mut self,
         error: hb46pp::client::ClientError,
     ) -> anyhow::Result<DiscoveryOutput> {
-        let Some(window) = error.next_attempt_window() else {
+        let Some(action) = error.retry_action() else {
             return Err(error).context("HB46PP provisioning failed");
         };
 
-        let retry_after = choose_next_attempt_delay(window);
+        let retry_after = choose_next_attempt_delay(action.window());
+
+        let state = match action {
+            hb46pp::client::RetryAction::DisableMigration(_) => DiscoveryState::NoService,
+            hb46pp::client::RetryAction::PreserveMigration(_) => DiscoveryState::Unavailable,
+            _ => DiscoveryState::Unavailable,
+        };
 
         tracing::warn!(
             error = %error,
+            discovery_state = ?state,
             retry_after_secs = retry_after.as_secs(),
             "HB46PP provisioning failed, retry deferred"
         );
 
-        Ok(self.retain(None, retry_after))
+        Ok(self.retain(state, retry_after))
     }
 
     fn apply_response(
@@ -153,14 +171,26 @@ impl Hb46ppRuntime {
         let aftr = crate::hb46pp::dslite_aftr(response.data())
             .context("invalid DS-Lite provisioning offer")?;
 
-        match &aftr {
-            Some(address) => tracing::debug!(
-                source = "hb46pp",
-                aftr = ?address,
-                "AFTR source selected"
-            ),
-            None => tracing::debug!("HB46PP response has no active DS-Lite offer"),
+        if let Some(token) = response.data().token().cloned() {
+            self.request.set_token(Some(token));
         }
+
+        let state = match aftr {
+            Some(address) => {
+                tracing::debug!(
+                    source = "hb46pp",
+                    aftr = ?address,
+                    "AFTR source selected"
+                );
+
+                DiscoveryState::Available(address)
+            }
+            None => {
+                tracing::debug!("HB46PP response has no active DS-Lite offer");
+
+                DiscoveryState::NoService
+            }
+        };
 
         tracing::debug!(
             refresh_after_secs = next_attempt_after.as_secs(),
@@ -169,16 +199,12 @@ impl Hb46ppRuntime {
 
         // Cache-Control no-store prohibits persistence, not retaining the
         // provisioning result in memory.
-        Ok(self.retain(aftr, next_attempt_after))
+        Ok(self.retain(state, next_attempt_after))
     }
 
-    fn retain(
-        &mut self,
-        aftr: Option<AftrAddress>,
-        next_attempt_after: Duration,
-    ) -> DiscoveryOutput {
+    fn retain(&mut self, state: DiscoveryState, next_attempt_after: Duration) -> DiscoveryOutput {
         let retained = RetainedDiscovery {
-            aftr,
+            state,
             next_attempt_at: Instant::now() + next_attempt_after,
         };
         let output = retained.output();
@@ -264,7 +290,7 @@ impl DiscoveryRuntime {
         match &mut self.kind {
             DiscoveryRuntimeKind::None => {
                 tracing::debug!("automatic AFTR discovery is disabled");
-                Ok(DiscoveryOutput::new(None, None))
+                Ok(DiscoveryOutput::new(DiscoveryState::Unavailable, None))
             }
             #[cfg(feature = "hb46pp")]
             DiscoveryRuntimeKind::Hb46pp(runtime) => runtime.discover_aftr().await,
@@ -327,7 +353,7 @@ mod tests {
     fn retained_discovery_expires_at_next_attempt_deadline() {
         let now = Instant::now();
         let retained = RetainedDiscovery {
-            aftr: None,
+            state: DiscoveryState::Unavailable,
             next_attempt_at: now + Duration::from_secs(1),
         };
 
@@ -345,5 +371,41 @@ mod tests {
             error.to_string(),
             "HB46PP support is not included in this build"
         );
+    }
+
+    #[cfg(feature = "hb46pp")]
+    #[test]
+    fn malformed_bootstrap_disables_discovered_service() {
+        let runtime = DiscoveryRuntime::from_config(&hb46pp_discovery_config()).unwrap();
+        let DiscoveryRuntimeKind::Hb46pp(mut runtime) = runtime.kind else {
+            unreachable!();
+        };
+
+        let output = runtime
+            .handle_provisioning_error(hb46pp::client::ClientError::UnexpectedRecordCount(2))
+            .unwrap();
+        let (state, next_attempt_at) = output.into_parts();
+
+        assert!(matches!(state, DiscoveryState::NoService));
+        assert!(next_attempt_at.is_some());
+    }
+
+    #[cfg(feature = "hb46pp")]
+    #[test]
+    fn temporary_resolver_failure_keeps_discovered_service() {
+        let runtime = DiscoveryRuntime::from_config(&hb46pp_discovery_config()).unwrap();
+        let DiscoveryRuntimeKind::Hb46pp(mut runtime) = runtime.kind else {
+            unreachable!();
+        };
+
+        let output = runtime
+            .handle_provisioning_error(hb46pp::client::ClientError::Resolver(Box::new(
+                std::io::Error::other("DNS lookup failed"),
+            )))
+            .unwrap();
+        let (state, next_attempt_at) = output.into_parts();
+
+        assert!(matches!(state, DiscoveryState::Unavailable));
+        assert!(next_attempt_at.is_some());
     }
 }
