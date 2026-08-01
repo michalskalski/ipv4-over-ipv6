@@ -4,7 +4,7 @@
 [HTTP-Based IPv4 over IPv6 Provisioning Protocol][hb46pp-spec] used to discover
 provisioning parameters for IPv4-over-IPv6 methods. It implements bootstrap TXT
 discovery, request and response validation, IPv6-only HTTP transport, protocol
-redirects, and retry timing guidance.
+redirects, and retry timing and migration-state guidance.
 
 Provisioning data for each supported IPv4-over-IPv6 method is retained as
 JSON. Applications select a method and interpret its parameters.
@@ -21,7 +21,7 @@ use hb46pp::{Capability, FirmwareVersion, Product, ProvisioningRequest, VendorId
 use hb46pp::client::{DefaultClient, ProvisioningOutcome};
 
 async fn provision() -> Result<(), Box<dyn std::error::Error>> {
-    let request = ProvisioningRequest::new(
+    let mut request = ProvisioningRequest::new(
         "000000".parse::<VendorId>()?,
         "example-router".parse::<Product>()?,
         "1_0_0".parse::<FirmwareVersion>()?,
@@ -39,9 +39,13 @@ async fn provision() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(offer) = response.data().select(&[Capability::DsLite]) {
                 println!("DS-Lite parameters: {}", offer.parameters());
             }
+
+            if let Some(token) = response.data().token().cloned() {
+                request.set_token(Some(token));
+            }
         }
         ProvisioningOutcome::NotFound => {
-            println!("HB46PP is not available on this network");
+            println!("disable the previous HB46PP-provisioned mechanism");
         }
     }
     println!(
@@ -55,9 +59,11 @@ async fn provision() -> Result<(), Box<dyn std::error::Error>> {
 # }
 ```
 
-The library reports when HB46PP recommends making the next request, but does
-not choose a random delay, sleep, monitor network changes, or persist
-provisioning data. Those responsibilities remain with the application.
+The library provides retry timing and uses `ClientError::retry_action` to
+distinguish disabling from preserving the previous migration mechanism. It does
+not choose a random delay, sleep, monitor network changes, modify network
+configuration, or persist data. Those responsibilities remain with the
+application.
 
 ## Features
 
