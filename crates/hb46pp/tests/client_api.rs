@@ -10,8 +10,8 @@ use hb46pp::client::DefaultDiscoveryResolver;
 #[cfg(feature = "default-transport")]
 use hb46pp::client::DefaultTransport;
 use hb46pp::client::{
-    Client, DiscoveryAnswer, DiscoveryResolver, ProvisioningOutcome, Transport, TransportRequest,
-    TransportResponse,
+    Client, ClientError, DiscoveryAnswer, DiscoveryResolver, ProvisioningOutcome, RetryAction,
+    Transport, TransportRequest, TransportResponse,
 };
 #[cfg(feature = "default-client")]
 use hb46pp::client::{DefaultClient, DefaultClientError};
@@ -95,4 +95,16 @@ fn downstream_crates_can_use_the_default_transport() {
     fn accepts_transport_type<T: Transport>() {}
 
     accepts_transport_type::<DefaultTransport>();
+}
+
+#[test]
+fn downstream_crates_can_inspect_retry_actions() {
+    let action = ClientError::UnexpectedRecordCount(2)
+        .retry_action()
+        .unwrap();
+
+    assert!(matches!(&action, RetryAction::DisableMigration(_)));
+
+    let window = action.window();
+    assert!(window.min() <= window.max());
 }

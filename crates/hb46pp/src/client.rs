@@ -54,6 +54,26 @@ impl NextAttemptWindow {
     }
 }
 
+/// The protocol action associated with a failed provisioning attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetryAction {
+    /// Disable the migration mechanism selected by the previous HB46PP
+    /// provisioning result before retrying.
+    DisableMigration(NextAttemptWindow),
+    /// Preserve the active migration mechanism while waiting to retry.
+    PreserveMigration(NextAttemptWindow),
+}
+
+impl RetryAction {
+    /// Returns the recommended interval before the next attempt.
+    pub fn window(&self) -> NextAttemptWindow {
+        match self {
+            Self::DisableMigration(window) | Self::PreserveMigration(window) => *window,
+        }
+    }
+}
+
 /// An outbound HB46PP provisioning request for a transport to send.
 ///
 /// The transport must connect to the endpoint over IPv6 and apply the
@@ -180,6 +200,9 @@ pub enum ProvisioningOutcome {
     /// A bootstrap record was found and provisioning data was received.
     Provisioned(ProvisioningResponse),
     /// DNS returned NXDOMAIN or NODATA for the bootstrap discovery name.
+    ///
+    /// HB46PP requires disabling the migration mechanism selected by the
+    /// previous provisioning result before waiting for the next attempt.
     NotFound,
 }
 
@@ -319,28 +342,42 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    /// Returns the interval in which HB46PP recommends retrying this failure.
+    /// Returns the protocol action prescribed for this failure.
     ///
-    /// `None` means HB46PP does not prescribe a retry window for the failure.
-    pub fn next_attempt_window(&self) -> Option<NextAttemptWindow> {
+    /// `None` means HB46PP does not prescribe a recovery action for the
+    /// failure. The caller remains responsible for scheduling another attempt
+    /// and applying any change to the active migration mechanism.
+    pub fn retry_action(&self) -> Option<RetryAction> {
         match self {
-            Self::Resolver(_) => Some(NextAttemptWindow::new(
+            Self::Resolver(_) => Some(RetryAction::PreserveMigration(NextAttemptWindow::new(
                 DISCOVERY_FAILURE_MIN,
                 DISCOVERY_FAILURE_MAX,
-            )),
-            Self::UnexpectedRecordCount(_) | Self::Bootstrap(_) => Some(NextAttemptWindow::new(
-                DISCOVERY_NOT_FOUND_MIN,
-                DISCOVERY_NOT_FOUND_MAX,
-            )),
+            ))),
+            Self::UnexpectedRecordCount(_) | Self::Bootstrap(_) => {
+                Some(RetryAction::DisableMigration(NextAttemptWindow::new(
+                    DISCOVERY_NOT_FOUND_MIN,
+                    DISCOVERY_NOT_FOUND_MAX,
+                )))
+            }
             Self::Transport(_)
             | Self::ResponseEncoding(_)
             | Self::ProvisioningData(_)
-            | Self::UnexpectedResponseStatus(_) => Some(NextAttemptWindow::new(
-                PROVISIONING_FAILURE_MIN,
-                PROVISIONING_FAILURE_MAX,
+            | Self::UnexpectedResponseStatus(_) => Some(RetryAction::PreserveMigration(
+                NextAttemptWindow::new(PROVISIONING_FAILURE_MIN, PROVISIONING_FAILURE_MAX),
             )),
             Self::ProvisioningUrl(_) | Self::Redirect(_) => None,
         }
+    }
+
+    /// Returns the interval in which HB46PP recommends retrying this failure.
+    ///
+    /// This exposes scheduling guidance only. Callers managing an active
+    /// migration mechanism should use [`Self::retry_action`] so the prescribed
+    /// effect on that mechanism is not discarded.
+    ///
+    /// `None` means HB46PP does not prescribe a retry window for the failure.
+    pub fn next_attempt_window(&self) -> Option<NextAttemptWindow> {
+        self.retry_action().map(|action| action.window())
     }
 }
 
@@ -929,6 +966,37 @@ mod tests {
             ))
         );
         assert_eq!(unspecified.next_attempt_window(), None);
+    }
+
+    #[test]
+    fn client_errors_expose_protocol_retry_actions() {
+        let resolver = ClientError::Resolver(Box::new(std::io::Error::other("failed")));
+        let malformed_discovery = ClientError::UnexpectedRecordCount(2);
+        let provisioning = ClientError::UnexpectedResponseStatus(500);
+        let unspecified = ClientError::Redirect(RedirectError::MissingLocation);
+
+        assert_eq!(
+            resolver.retry_action(),
+            Some(RetryAction::PreserveMigration(NextAttemptWindow::new(
+                Duration::from_secs(60),
+                Duration::from_secs(10 * 60)
+            )))
+        );
+        assert_eq!(
+            malformed_discovery.retry_action(),
+            Some(RetryAction::DisableMigration(NextAttemptWindow::new(
+                Duration::from_secs(60 * 60),
+                Duration::from_secs(3 * 60 * 60)
+            )))
+        );
+        assert_eq!(
+            provisioning.retry_action(),
+            Some(RetryAction::PreserveMigration(NextAttemptWindow::new(
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(30 * 60)
+            )))
+        );
+        assert_eq!(unspecified.retry_action(), None);
     }
 
     #[tokio::test]
