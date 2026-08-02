@@ -1,0 +1,42 @@
+#!/sbin/sh
+
+. /lib/svc/share/smf_include.sh
+
+case "$1" in
+start)
+    if ! /usr/sbin/dslite-b4 check-config >/dev/null; then
+        exit "$SMF_EXIT_ERR_CONFIG"
+    fi
+
+    if [ ! -d /var/run/dslite-b4 ]; then
+        mkdir /var/run/dslite-b4 || exit "$SMF_EXIT_ERR_FATAL"
+        chmod 0755 /var/run/dslite-b4 || exit "$SMF_EXIT_ERR_FATAL"
+    fi
+
+    smf_clear_env
+    /usr/sbin/dslite-b4 run >/dev/null &
+    child=$!
+    attempts=0
+    while [ "$attempts" -lt 60 ]; do
+        if [ -r /var/run/dslite-b4/dslite-b4.pid ]; then
+            ready_pid=`sed -n '1p' /var/run/dslite-b4/dslite-b4.pid`
+            if [ "$ready_pid" = "$child" ]; then
+                exit "$SMF_EXIT_OK"
+            fi
+        fi
+        if ! kill -0 "$child" 2>/dev/null; then
+            wait "$child"
+            exit "$SMF_EXIT_ERR_FATAL"
+        fi
+        sleep 1
+        attempts=`expr "$attempts" + 1`
+    done
+
+    kill -TERM "$child" 2>/dev/null
+    exit "$SMF_EXIT_ERR_FATAL"
+    ;;
+*)
+    echo "Usage: $0 start" >&2
+    exit "$SMF_EXIT_ERR_FATAL"
+    ;;
+esac

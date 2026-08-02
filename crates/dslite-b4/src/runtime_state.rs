@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::atomic_file::atomic_replace;
 use crate::config::AftrAddress;
 
 const PROVIDED_AFTR_FILENAME: &str = "aftr";
@@ -13,7 +14,7 @@ const PID_FILENAME: &str = "dslite-b4.pid";
 
 pub struct PidFile {
     path: PathBuf,
-    _lock: File,
+    lock: File,
     dev: u64,
     ino: u64,
 }
@@ -22,7 +23,7 @@ impl PidFile {
     pub fn create(runtime_dir: &Path) -> anyhow::Result<Self> {
         ensure_runtime_dir(runtime_dir)?;
         let path = runtime_dir.join(PID_FILENAME);
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -44,17 +45,26 @@ impl PidFile {
             .with_context(|| format!("reading pidfile metadata {}", path.display()))?;
         file.set_len(0)
             .with_context(|| format!("truncating pidfile {}", path.display()))?;
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("seeking pidfile {}", path.display()))?;
-        writeln!(file, "{}", std::process::id())
-            .with_context(|| format!("writing pidfile {}", path.display()))?;
 
         Ok(Self {
             path,
-            _lock: file,
+            lock: file,
             dev: metadata.dev(),
             ino: metadata.ino(),
         })
+    }
+
+    /// Marks initialization complete. Until this is called the locked,
+    /// empty pidfile deliberately means "not ready yet".
+    pub fn mark_ready(&mut self) -> anyhow::Result<()> {
+        self.lock
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking pidfile {}", self.path.display()))?;
+        writeln!(self.lock, "{}", std::process::id())
+            .with_context(|| format!("writing pidfile {}", self.path.display()))?;
+        self.lock
+            .sync_all()
+            .with_context(|| format!("syncing pidfile {}", self.path.display()))
     }
 }
 
@@ -95,38 +105,8 @@ pub fn write_provided_aftr(runtime_dir: &Path, addr: &str) -> anyhow::Result<()>
 
     ensure_runtime_dir(runtime_dir)?;
     let path = runtime_dir.join(PROVIDED_AFTR_FILENAME);
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_nanos();
-    let tmp_path = runtime_dir.join(format!(
-        ".{PROVIDED_AFTR_FILENAME}.{}.{}.tmp",
-        std::process::id(),
-        nanos
-    ));
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .with_context(|| format!("opening temporary AFTR state file {}", tmp_path.display()))?;
-
-    writeln!(file, "{addr}")
-        .with_context(|| format!("writing temporary AFTR state file {}", tmp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing temporary AFTR state file {}", tmp_path.display()))?;
-    drop(file);
-
-    std::fs::rename(&tmp_path, &path).with_context(|| {
-        format!(
-            "renaming AFTR state file {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-
-    Ok(())
+    let contents = format!("{addr}\n");
+    atomic_replace(&path, None, contents.as_bytes())
 }
 
 pub fn clear_provided_aftr(runtime_dir: &Path) -> anyhow::Result<()> {
@@ -149,8 +129,11 @@ pub fn signal_daemon_refresh(runtime_dir: &Path) -> anyhow::Result<()> {
         }
     };
 
+    let pid = pid.trim();
+    if pid.is_empty() {
+        return Ok(());
+    }
     let pid: libc::pid_t = pid
-        .trim()
         .parse()
         .with_context(|| format!("parsing pidfile {}", path.display()))?;
 
@@ -168,4 +151,32 @@ pub fn signal_daemon_refresh(runtime_dir: &Path) -> anyhow::Result<()> {
 fn ensure_runtime_dir(runtime_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(runtime_dir)
         .with_context(|| format!("creating runtime state directory {}", runtime_dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pidfile_is_empty_until_ready() {
+        let dir = std::env::temp_dir().join(format!(
+            "dslite-b4-pid-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let mut pidfile = PidFile::create(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(PID_FILENAME)).unwrap(), "");
+        signal_daemon_refresh(&dir).unwrap();
+        pidfile.mark_ready().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(PID_FILENAME)).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+        drop(pidfile);
+        std::fs::remove_dir(&dir).unwrap();
+    }
 }

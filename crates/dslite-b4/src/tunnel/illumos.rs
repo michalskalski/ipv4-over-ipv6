@@ -132,7 +132,7 @@ impl IllumosBackend {
                 status
             )));
         }
-        tracing::debug!("ip interface assigned to tunel");
+        tracing::debug!("ip interface assigned to tunnel");
         Ok(())
     }
 
@@ -323,6 +323,67 @@ impl IllumosBackend {
         Ok(())
     }
 
+    fn rollback_setup(
+        &self,
+        dladm_handle: &DladmHandle,
+        interface_created: bool,
+        local_v4_configured: bool,
+        default_route_may_exist: bool,
+    ) {
+        let mut failures = Vec::new();
+
+        if default_route_may_exist {
+            match RouteSocket::open().and_then(|route| route.delete_default_v4(AFTR_V4_ELEMENT)) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => failures.push(format!("removing default route: {error}")),
+            }
+        }
+
+        if local_v4_configured {
+            match open_inet_dgram_socket() {
+                Ok(socket) => {
+                    // SAFETY: `socket` is an AF_INET/SOCK_DGRAM socket suitable
+                    // for SIOCSLIF* ioctls and remains live for the call.
+                    if let Err(error) = unsafe {
+                        set_local_addr(socket.as_raw_fd(), &self.cname, Ipv4Addr::UNSPECIFIED)
+                    } {
+                        failures.push(format!("clearing local IPv4 address: {error}"));
+                    }
+                }
+                Err(error) => failures.push(format!(
+                    "opening address configuration socket for rollback: {error}"
+                )),
+            }
+        }
+
+        if interface_created {
+            match open_ipadm() {
+                Ok(handle) => {
+                    if let Err(error) = self.delete_if(&handle) {
+                        failures.push(error.to_string());
+                    }
+                }
+                Err(status) => failures.push(format!(
+                    "opening libipadm handle for rollback failed with status {status}"
+                )),
+            }
+        }
+
+        if let Err(error) = self.delete_tunnel(dladm_handle) {
+            failures.push(error.to_string());
+        }
+
+        if failures.is_empty() {
+            tracing::debug!("rolled back partially created tunnel");
+        } else {
+            tracing::warn!(
+                errors = %failures.join("; "),
+                "failed to fully roll back partially created tunnel"
+            );
+        }
+    }
+
     fn name_to_linkid(&self, handle: &DladmHandle) -> (u32, u32) {
         let mut link_id: u32 = 0;
 
@@ -356,54 +417,77 @@ impl TunnelBackend for IllumosBackend {
             TunnelError::CreationFailed(format!("unable to open handle, dladm_open status {}", e))
         })?;
         let link_id = self.create_tunnel(&handle, &desired)?;
+        let mut interface_created = false;
+        let mut local_v4_configured = false;
+        let mut default_route_may_exist = false;
 
-        if let Some(encapsulation_limit) = desired.encapsulation_limit {
-            self.set_encapsulation_limit(&handle, link_id, encapsulation_limit)
-                .map_err(|status| {
-                    TunnelError::CreationFailed(format!(
-                        "setting encaplimit, dladm_set_linkprop status: {status}"
-                    ))
-                })?;
-        }
+        let setup_result = (|| -> Result<(), TunnelError> {
+            if let Some(encapsulation_limit) = desired.encapsulation_limit {
+                self.set_encapsulation_limit(&handle, link_id, encapsulation_limit)
+                    .map_err(|status| {
+                        TunnelError::CreationFailed(format!(
+                            "setting encaplimit, dladm_set_linkprop status: {status}"
+                        ))
+                    })?;
+            }
 
-        let ip_handle = open_ipadm().map_err(|e| {
-            TunnelError::CreationFailed(format!("unable to open handle, ipadm_open status {}", e))
-        })?;
-        self.create_if(&ip_handle)?;
+            let ip_handle = open_ipadm().map_err(|e| {
+                TunnelError::CreationFailed(format!("unable to open handle, ipadm_open status {e}"))
+            })?;
+            self.create_if(&ip_handle)?;
+            interface_created = true;
 
-        let sock_fd = open_inet_dgram_socket().map_err(|e| {
-            TunnelError::CreationFailed(format!("opening address configuration socket: {e}"))
-        })?;
-        let fd = sock_fd.as_raw_fd();
+            let sock_fd = open_inet_dgram_socket().map_err(|e| {
+                TunnelError::CreationFailed(format!("opening address configuration socket: {e}"))
+            })?;
+            let fd = sock_fd.as_raw_fd();
 
-        // The calls below each require an fd that accepts SIOCSLIF* ioctls.
-        // `open_inet_dgram_socket` returns an AF_INET/SOCK_DGRAM socket.
-        // `sock_fd` (the `OwnedFd`) lives until function return,
-        // so `fd` remains valid across all calls.
+            // The calls below each require an fd that accepts SIOCSLIF* ioctls.
+            // `open_inet_dgram_socket` returns an AF_INET/SOCK_DGRAM socket.
+            // `sock_fd` (the `OwnedFd`) lives until function return,
+            // so `fd` remains valid across all calls.
 
-        if let Some(mtu) = desired.mtu {
+            if let Some(mtu) = desired.mtu {
+                // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
+                unsafe { set_mtu(fd, &self.cname, mtu) }
+                    .map_err(|e| TunnelError::CreationFailed(format!("set_mtu: {e}")))?;
+            }
+
             // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
-            unsafe { set_mtu(fd, &self.cname, mtu) }
-                .map_err(|e| TunnelError::CreationFailed(format!("set_mtu: {e}")))?;
-        }
+            unsafe { set_local_addr(fd, &self.cname, desired.local_v4) }
+                .map_err(|e| TunnelError::CreationFailed(format!("set_local_addr: {e}")))?;
+            local_v4_configured = true;
+            // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
+            unsafe { set_dst_addr(fd, &self.cname, AFTR_V4_ELEMENT) }
+                .map_err(|e| TunnelError::CreationFailed(format!("set_dst_addr: {e}")))?;
+            // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
+            unsafe { set_netmask(fd, &self.cname, B4_V4_NETMASK) }
+                .map_err(|e| TunnelError::CreationFailed(format!("set_netmask: {e}")))?;
+            // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
+            unsafe { bring_up(fd, &self.cname) }
+                .map_err(|e| TunnelError::CreationFailed(format!("bring_up: {e}")))?;
+            let route_sock = RouteSocket::open()
+                .map_err(|e| TunnelError::CreationFailed(format!("PF_ROUTE open: {e}")))?;
+            // A timeout or malformed acknowledgement does not prove that the
+            // kernel rejected the preceding route request, so rollback must
+            // attempt deletion once the add has been issued.
+            default_route_may_exist = true;
+            route_sock
+                .add_default_v4(AFTR_V4_ELEMENT)
+                .map_err(|e| TunnelError::CreationFailed(format!("add default route: {e}")))?;
 
-        // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
-        unsafe { set_local_addr(fd, &self.cname, desired.local_v4) }
-            .map_err(|e| TunnelError::CreationFailed(format!("set_local_addr: {}", e)))?;
-        // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
-        unsafe { set_dst_addr(fd, &self.cname, AFTR_V4_ELEMENT) }
-            .map_err(|e| TunnelError::CreationFailed(format!("set_dst_addr: {}", e)))?;
-        // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
-        unsafe { set_netmask(fd, &self.cname, B4_V4_NETMASK) }
-            .map_err(|e| TunnelError::CreationFailed(format!("set_netmask: {}", e)))?;
-        // SAFETY: `fd` is a valid SIOCSLIF*-capable socket (see above).
-        unsafe { bring_up(fd, &self.cname) }
-            .map_err(|e| TunnelError::CreationFailed(format!("bring_up: {}", e)))?;
-        let route_sock = RouteSocket::open()
-            .map_err(|e| TunnelError::CreationFailed(format!("PF_ROUTE open: {e}")))?;
-        route_sock
-            .add_default_v4(AFTR_V4_ELEMENT)
-            .map_err(|e| TunnelError::CreationFailed(format!("add default route: {e}")))?;
+            Ok(())
+        })();
+
+        if let Err(error) = setup_result {
+            self.rollback_setup(
+                &handle,
+                interface_created,
+                local_v4_configured,
+                default_route_may_exist,
+            );
+            return Err(error);
+        }
 
         tracing::info!(
             name = %self.cname.to_string_lossy(),

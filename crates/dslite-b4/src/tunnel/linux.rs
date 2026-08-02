@@ -160,6 +160,21 @@ impl LinuxBackend {
             .map_err(|e| TunnelError::RouteFailed(e.to_string()))
             .inspect(|_| tracing::debug!("default route added"))
     }
+
+    async fn delete_link(handle: &Handle, index: u32) -> Result<(), rtnetlink::Error> {
+        handle.link().del(index).execute().await
+    }
+
+    async fn rollback_setup(&self, handle: &Handle, index: u32) {
+        match Self::delete_link(handle, index).await {
+            Ok(()) => tracing::debug!(name = %self.name, "rolled back partially created tunnel"),
+            Err(error) => tracing::warn!(
+                name = %self.name,
+                error = %error,
+                "failed to roll back partially created tunnel"
+            ),
+        }
+    }
 }
 
 impl TunnelBackend for LinuxBackend {
@@ -168,8 +183,16 @@ impl TunnelBackend for LinuxBackend {
             .map_err(|e| TunnelError::CreationFailed(format!("opening netlink connection: {e}")))?;
 
         let index = self.create_tunnel(&handle, &desired).await?;
-        self.add_address(&handle, index, desired.local_v4).await?;
-        self.add_default_route(&handle, index).await?;
+        let setup_result = async {
+            self.add_address(&handle, index, desired.local_v4).await?;
+            self.add_default_route(&handle, index).await
+        }
+        .await;
+
+        if let Err(error) = setup_result {
+            self.rollback_setup(&handle, index).await;
+            return Err(error);
+        }
 
         tracing::info!(
             name = %self.name,
@@ -244,10 +267,7 @@ impl TunnelBackend for LinuxBackend {
                 TunnelError::DestroyFailed(format!("interface {} not found", self.name))
             })?;
 
-        handle
-            .link()
-            .del(index)
-            .execute()
+        Self::delete_link(&handle, index)
             .await
             .map_err(|e| TunnelError::DestroyFailed(e.to_string()))
             .inspect(|_| tracing::info!(name=%self.name, "interface removed"))

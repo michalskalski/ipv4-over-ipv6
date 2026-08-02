@@ -1,6 +1,11 @@
+[logging]
+# Minimum level for daemon log records. RUST_LOG takes precedence when set.
+# level = "info"
+
 [runtime]
-# pidfile, provided AFTR, HB46PP cache, and status snapshot
-state_dir = "/var/run/dslite-b4"
+# pidfile, provided AFTR, and status snapshot. Linux defaults to /run/dslite-b4;
+# illumos defaults to /var/run/dslite-b4.
+# state_dir = "/run/dslite-b4"
 
 [tunnel]
 # When omitted, local_v6 is discovered from the route to the AFTR.

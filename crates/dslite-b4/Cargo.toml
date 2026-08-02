@@ -2,7 +2,7 @@
 name = "dslite-b4"
 version = "0.1.0"
 edition = "2024"
-description = "DS-Lite B4 (RFC 6333) client daemon for illumos and Linux"
+description = "DS-Lite B4 tunnel management daemon"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/michalskalski/ipv4-over-ipv6"
 
@@ -26,6 +26,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1.0.102"
 libc = "0.2.186"
+jiff = { version = "0.2", features = ["serde"] }
+serde_json = "1"
 hb46pp = {
     version = "0.1.1",
     path = "../hb46pp",
@@ -38,6 +40,7 @@ rand = { version = "0.10.2", optional = true }
 rtnetlink = "0.20.0"
 futures-util = "0.3.32"
 futures-channel = "0.3.32"
+sd-notify = "0.5"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

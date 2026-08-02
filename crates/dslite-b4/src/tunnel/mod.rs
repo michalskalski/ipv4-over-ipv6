@@ -73,6 +73,11 @@ pub enum EncapsulationLimit {
 }
 
 pub trait TunnelBackend: Send + Sync {
+    /// Creates the tunnel and its required network state.
+    ///
+    /// If setup fails after creating platform state, the backend makes a best
+    /// effort to remove state created by that call. The original setup error is
+    /// returned. Cleanup errors are logged separately.
     fn setup(&self, desired: DesiredState) -> impl Future<Output = Result<(), TunnelError>> + Send;
     fn update(
         &self,

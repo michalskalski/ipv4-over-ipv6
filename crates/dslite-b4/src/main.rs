@@ -7,7 +7,7 @@ use dslite_b4::tunnel::linux::LinuxBackend;
 use dslite_b4::{
     aftr::AftrSelector,
     aftr_discovery::{DiscoveryRuntime, DiscoveryState},
-    config::{AftrAddress, Config},
+    config::{AftrAddress, Config, DiscoveryMethod},
     discovery::discover_local_v6,
     dns::resolve_aftr_addresses,
     lifecycle::{self, Desired, reconcile_once},
@@ -15,19 +15,26 @@ use dslite_b4::{
     runtime_state::{
         self, PidFile, clear_provided_aftr, signal_daemon_refresh, write_provided_aftr,
     },
+    status::{
+        self, AftrSource, ReconcileReason, SCHEMA_VERSION, StatusAction, StatusDesired,
+        StatusSnapshot,
+    },
+    supervisor,
     tunnel::{DesiredState, Observed, TunnelBackend},
 };
 use std::{
+    io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::signal;
 
+mod logging;
 mod wake;
-use wake::{WakeHint, schedule_next_wake};
+use wake::{ScheduledWake, WakeHint, WakeReason, schedule_next_wake};
 
 #[derive(Parser)]
-#[command(name = "dslite-b4", about = "DS-Lite B4 client")]
+#[command(name = "dslite-b4", about = "DS-Lite B4 tunnel manager")]
 struct Cli {
     #[arg(short, long, default_value = "/etc/dslite-b4.toml", global = true)]
     config: PathBuf,
@@ -39,76 +46,153 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Run,
-    CheckConfig,
-    SetAftr { addr: String },
+    CheckConfig {
+        /// Include the original TOML diagnostic. It may expose sensitive configuration values.
+        #[arg(long)]
+        show_source: bool,
+    },
+    SetAftr {
+        addr: String,
+    },
     ClearAftr,
+    Status {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dslite_b4=info".parse().unwrap()),
-        )
-        .init();
     let cli = Cli::parse();
-    let config = load_config(&cli.config)?;
     match cli.command.unwrap_or(Commands::Run) {
-        Commands::CheckConfig => {
+        Commands::CheckConfig { show_source } => {
+            let config = if show_source {
+                load_config_with_source(&cli.config)?
+            } else {
+                load_config(&cli.config)?
+            };
+            logging::init(config.logging.level);
             DiscoveryRuntime::validate_config(&config.discovery)?;
-
-            tracing::info!(?config);
+            write_command_output("configuration is valid")?;
         }
         Commands::Run => {
+            // SAFETY: `geteuid` has no preconditions and does not modify memory.
+            anyhow::ensure!(unsafe { libc::geteuid() } == 0, "daemon must run as UID 0");
+            let config = load_config(&cli.config)?;
+            logging::init(config.logging.level);
+            let pid = PidFile::create(&config.runtime.state_dir)?;
+            status::remove(&config.runtime.state_dir)?;
             let discovery = DiscoveryRuntime::from_config(&config.discovery)?;
-            let _pid = PidFile::create(&config.runtime.state_dir)?;
 
             #[cfg(target_os = "linux")]
             let backend = LinuxBackend::new(config.tunnel.name.clone());
             #[cfg(target_os = "illumos")]
             let backend = IllumosBackend::new(config.tunnel.name.clone())?;
 
-            run(backend, &config, discovery).await?
+            run(backend, &config, discovery, pid).await?
         }
         Commands::SetAftr { addr } => {
+            let config = load_config(&cli.config)?;
+            logging::init(config.logging.level);
             write_provided_aftr(&config.runtime.state_dir, &addr)?;
             signal_daemon_refresh(&config.runtime.state_dir)?;
         }
         Commands::ClearAftr => {
+            let config = load_config(&cli.config)?;
+            logging::init(config.logging.level);
             clear_provided_aftr(&config.runtime.state_dir)?;
             signal_daemon_refresh(&config.runtime.state_dir)?;
         }
+        Commands::Status { json, state_dir } => {
+            let state_dir = state_dir.unwrap_or_else(status::default_state_dir);
+            let snapshot = StatusSnapshot::read(&state_dir)?;
+            if json {
+                write_command_output(&snapshot.pretty_json()?)?;
+            } else {
+                write_command_output(&snapshot.human(std::time::SystemTime::now()))?;
+            }
+        }
     }
     Ok(())
+}
+
+fn write_command_output(output: &str) -> anyhow::Result<()> {
+    match writeln!(io::stdout().lock(), "{output}") {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("writing command output"),
+    }
 }
 
 /// Desired tunnel state together with its scheduling constraint.
 struct DesiredComputation {
     desired: Desired,
     wake_hint: WakeHint,
+    aftr_source: AftrSource,
+    aftr: Option<String>,
+    local_ipv6: Option<std::net::Ipv6Addr>,
+    remote_ipv6: Option<std::net::Ipv6Addr>,
 }
 
 impl DesiredComputation {
-    fn resolved(state: DesiredState, next_attempt_at: Option<Instant>) -> Self {
+    fn resolved(
+        state: DesiredState,
+        next_attempt_at: Option<Instant>,
+        aftr_source: AftrSource,
+        aftr: String,
+    ) -> Self {
         Self {
             desired: Desired::Resolved(state),
             wake_hint: wake_hint_for_deadline(next_attempt_at, WakeHint::None),
+            aftr_source,
+            aftr: Some(aftr),
+            local_ipv6: Some(state.local_v6),
+            remote_ipv6: Some(state.remote_v6),
         }
     }
 
-    fn unavailable(next_attempt_at: Option<Instant>) -> Self {
+    fn unavailable(next_attempt_at: Option<Instant>, aftr_source: AftrSource) -> Self {
+        let no_deadline = if aftr_source == AftrSource::None {
+            WakeHint::None
+        } else {
+            WakeHint::GenericRetry
+        };
         Self {
             desired: Desired::Unavailable,
-            wake_hint: wake_hint_for_deadline(next_attempt_at, WakeHint::GenericRetry),
+            wake_hint: wake_hint_for_deadline(next_attempt_at, no_deadline),
+            aftr_source,
+            aftr: None,
+            local_ipv6: None,
+            remote_ipv6: None,
         }
     }
 
-    fn absent(next_attempt_at: Option<Instant>) -> Self {
+    fn absent(next_attempt_at: Option<Instant>, aftr_source: AftrSource) -> Self {
         Self {
             desired: Desired::Absent,
             wake_hint: wake_hint_for_deadline(next_attempt_at, WakeHint::None),
+            aftr_source,
+            aftr: None,
+            local_ipv6: None,
+            remote_ipv6: None,
         }
+    }
+
+    fn with_aftr(mut self, aftr: &AftrAddress) -> Self {
+        self.aftr = Some(aftr_text(aftr));
+        self
+    }
+
+    fn with_remote(mut self, remote: std::net::Ipv6Addr) -> Self {
+        self.remote_ipv6 = Some(remote);
+        self
+    }
+
+    fn with_local(mut self, local: Option<std::net::Ipv6Addr>) -> Self {
+        self.local_ipv6 = local;
+        self
     }
 }
 
@@ -128,10 +212,13 @@ async fn run<B: TunnelBackend>(
     backend: B,
     config: &Config,
     mut discovery: DiscoveryRuntime,
+    mut pidfile: PidFile,
 ) -> anyhow::Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
     let mut sigusr1 = signal::unix::signal(signal::unix::SignalKind::user_defined1())?;
     let mut network_changes = NetworkChanges::new()?;
+    pidfile.mark_ready()?;
+    supervisor::ready().context("notifying systemd that initialization completed")?;
     let mut aftr_selector = AftrSelector::new();
     let mut attempt: u64 = 0;
     'reconcile: loop {
@@ -140,7 +227,12 @@ async fn run<B: TunnelBackend>(
         let computation =
             compute_desired(config, &mut discovery, &mut aftr_selector, current_aftr).await?;
         let action = reconcile_once(&backend, &observed, &computation.desired).await?;
-        tracing::info!(?action, "reconciliation completed");
+        match action {
+            lifecycle::Plan::Keep | lifecycle::Plan::Noop => {
+                tracing::debug!(?action, "reconciliation completed");
+            }
+            _ => tracing::info!(?action, "reconciliation completed"),
+        }
 
         let wake_hint = computation.wake_hint;
 
@@ -157,6 +249,12 @@ async fn run<B: TunnelBackend>(
 
         if matches!(wake_hint, WakeHint::GenericRetry) {
             attempt += 1;
+        }
+
+        let snapshot = make_snapshot(config, &computation, action, scheduled)?;
+        snapshot.write_atomic(&config.runtime.state_dir)?;
+        if let Err(error) = supervisor::update(&snapshot) {
+            tracing::warn!(error = %error, "updating systemd status failed");
         }
 
         tracing::debug!(
@@ -208,7 +306,15 @@ async fn run<B: TunnelBackend>(
         }
     }
 
-    backend.teardown().await?;
+    if let Err(error) = supervisor::stopping() {
+        tracing::warn!(error = %error, "notifying systemd of shutdown failed");
+    }
+    if matches!(backend.observe().await?, Observed::Absent) {
+        tracing::debug!("tunnel already absent during shutdown");
+    } else {
+        backend.teardown().await?;
+    }
+    status::remove(&config.runtime.state_dir)?;
     Ok(())
 }
 
@@ -219,14 +325,73 @@ fn current_aftr(observed: &Observed) -> Option<std::net::Ipv6Addr> {
     }
 }
 
+fn make_snapshot(
+    config: &Config,
+    computation: &DesiredComputation,
+    action: lifecycle::Plan,
+    scheduled: ScheduledWake,
+) -> anyhow::Result<StatusSnapshot> {
+    let desired = status_desired(&computation.desired);
+    let last_action = status_action(action);
+    let next_reconcile_reason = status_reason(scheduled.reason);
+    let delay = scheduled.at.saturating_duration_since(Instant::now());
+
+    Ok(StatusSnapshot {
+        schema_version: SCHEMA_VERSION,
+        generated_at: status::timestamp_now(),
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        tunnel_name: config.tunnel.name.clone(),
+        desired,
+        aftr_source: computation.aftr_source,
+        aftr: computation.aftr.clone(),
+        local_ipv6: computation.local_ipv6,
+        remote_ipv6: computation.remote_ipv6,
+        last_action,
+        next_reconcile_at: status::timestamp_after(delay)?,
+        next_reconcile_reason,
+    })
+}
+
+fn status_desired(desired: &Desired) -> StatusDesired {
+    match desired {
+        Desired::Resolved(_) => StatusDesired::Resolved,
+        Desired::Absent => StatusDesired::Absent,
+        Desired::Unavailable => StatusDesired::Unavailable,
+    }
+}
+
+fn status_action(action: lifecycle::Plan) -> StatusAction {
+    match action {
+        lifecycle::Plan::Create(_) => StatusAction::Create,
+        lifecycle::Plan::Update { .. } => StatusAction::Update,
+        lifecycle::Plan::Rebuild(_) => StatusAction::Rebuild,
+        lifecycle::Plan::Teardown => StatusAction::Teardown,
+        lifecycle::Plan::Keep => StatusAction::Keep,
+        lifecycle::Plan::Noop => StatusAction::Noop,
+    }
+}
+
+fn status_reason(reason: WakeReason) -> ReconcileReason {
+    match reason {
+        WakeReason::Health => ReconcileReason::Health,
+        WakeReason::Discovery => ReconcileReason::Discovery,
+        WakeReason::GenericRetry => ReconcileReason::Retry,
+    }
+}
+
 async fn compute_desired(
     config: &Config,
     discovery: &mut DiscoveryRuntime,
     aftr_selector: &mut AftrSelector,
     current_aftr: Option<std::net::Ipv6Addr>,
 ) -> anyhow::Result<DesiredComputation> {
-    let (aftr, next_attempt_at) = match effective_aftr(config)? {
-        Some(aftr) => (aftr, None),
+    let automatic_source = match config.discovery.method {
+        DiscoveryMethod::Hb46pp => AftrSource::Hb46pp,
+        DiscoveryMethod::None => AftrSource::None,
+    };
+    let (aftr, next_attempt_at, aftr_source) = match effective_aftr(config)? {
+        Some((aftr, source)) => (aftr, None, source),
 
         None => {
             tracing::debug!("no static or externally provided AFTR, trying automatic discovery");
@@ -235,13 +400,17 @@ async fn compute_desired(
                 Ok(output) => {
                     let (state, next_attempt) = output.into_parts();
                     match state {
-                        DiscoveryState::Available(aftr) => (aftr, next_attempt),
+                        DiscoveryState::Available(aftr) => (aftr, next_attempt, automatic_source),
                         DiscoveryState::Unavailable => {
-                            return Ok(DesiredComputation::unavailable(next_attempt));
+                            return Ok(DesiredComputation::unavailable(
+                                next_attempt,
+                                automatic_source,
+                            )
+                            .with_local(config.tunnel.local_v6));
                         }
                         DiscoveryState::NoService => {
                             tracing::debug!("automatic AFTR discovery reported no service");
-                            return Ok(DesiredComputation::absent(next_attempt));
+                            return Ok(DesiredComputation::absent(next_attempt, automatic_source));
                         }
                     }
                 }
@@ -250,7 +419,8 @@ async fn compute_desired(
                         error = %error, "automatic AFTR discovery unavailable"
                     );
 
-                    return Ok(DesiredComputation::unavailable(None));
+                    return Ok(DesiredComputation::unavailable(None, automatic_source)
+                        .with_local(config.tunnel.local_v6));
                 }
             }
         }
@@ -262,14 +432,18 @@ async fn compute_desired(
         }
         Err(e) => {
             tracing::warn!(error = %e, "AFTR resolution unavailable");
-            return Ok(DesiredComputation::unavailable(None));
+            return Ok(DesiredComputation::unavailable(None, aftr_source)
+                .with_aftr(&aftr)
+                .with_local(config.tunnel.local_v6));
         }
     };
     let grace = Duration::from_secs(config.health.aftr_missing_grace_secs);
     let Some(aftr_ip) = aftr_selector.select(&aftr_candidates, current_aftr, grace, Instant::now())
     else {
         tracing::debug!("no AFTR address selected from resolved candidates");
-        return Ok(DesiredComputation::unavailable(None));
+        return Ok(DesiredComputation::unavailable(None, aftr_source)
+            .with_aftr(&aftr)
+            .with_local(config.tunnel.local_v6));
     };
     tracing::debug!(remote_v6 = %aftr_ip, "AFTR address selected");
     let local_v6 = match config.tunnel.local_v6 {
@@ -288,12 +462,15 @@ async fn compute_desired(
             }
             Err(e) if e.is_transient() => {
                 tracing::warn!(error = %e, "discover local IPv6 addr failed");
-                return Ok(DesiredComputation::unavailable(None));
+                return Ok(DesiredComputation::unavailable(None, aftr_source)
+                    .with_aftr(&aftr)
+                    .with_remote(aftr_ip));
             }
             Err(e) => return Err(anyhow::anyhow!(e)),
         },
     };
 
+    let aftr_text = aftr_text(&aftr);
     Ok(DesiredComputation::resolved(
         DesiredState {
             local_v6,
@@ -303,13 +480,15 @@ async fn compute_desired(
             encapsulation_limit: config.tunnel.encapsulation_limit,
         },
         next_attempt_at,
+        aftr_source,
+        aftr_text,
     ))
 }
 
-fn effective_aftr(config: &Config) -> anyhow::Result<Option<AftrAddress>> {
+fn effective_aftr(config: &Config) -> anyhow::Result<Option<(AftrAddress, AftrSource)>> {
     if let Some(address) = &config.aftr.address {
         tracing::debug!(source = "config", aftr = ?address, "AFTR source selected");
-        return Ok(Some(address.clone()));
+        return Ok(Some((address.clone(), AftrSource::Config)));
     }
 
     let provided = runtime_state::read_provided_aftr(&config.runtime.state_dir)?;
@@ -322,13 +501,36 @@ fn effective_aftr(config: &Config) -> anyhow::Result<Option<AftrAddress>> {
         );
     }
 
-    Ok(provided)
+    Ok(provided.map(|address| (address, AftrSource::Provided)))
+}
+
+fn aftr_text(address: &AftrAddress) -> String {
+    match address {
+        AftrAddress::Ip(address) => address.to_string(),
+        AftrAddress::Fqdn(name) => name.clone(),
+    }
 }
 
 fn load_config(path: &Path) -> anyhow::Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    let safe_path = safe_path(path);
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading config {safe_path}"))?;
+    dslite_b4::config::parse(&text).with_context(|| format!("parsing config {safe_path}"))
+}
+
+fn load_config_with_source(path: &Path) -> anyhow::Result<Config> {
+    let safe_path = safe_path(path);
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading config {safe_path}"))?;
+    dslite_b4::config::parse_with_source(&text)
+        .with_context(|| format!("parsing config {safe_path}"))
+}
+
+fn safe_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +629,15 @@ mod tests {
         }
     }
 
+    fn resolved_computation(next_attempt_at: Option<Instant>) -> DesiredComputation {
+        DesiredComputation::resolved(
+            test_desired_state(),
+            next_attempt_at,
+            AftrSource::Config,
+            "2001:db8::1".to_owned(),
+        )
+    }
+
     #[test]
     fn desired_computation_selects_wake_policy() {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -435,42 +646,47 @@ mod tests {
         let cases = [
             (
                 "resolved static state",
-                DesiredComputation::resolved(test_desired_state(), None),
+                resolved_computation(None),
                 WakeHint::None,
             ),
             (
                 "resolved provisioned state",
-                DesiredComputation::resolved(test_desired_state(), Some(deadline)),
+                resolved_computation(Some(deadline)),
                 WakeHint::Deadline(deadline),
             ),
             (
                 "resolved state with expired deadline",
-                DesiredComputation::resolved(test_desired_state(), Some(expired_deadline)),
+                resolved_computation(Some(expired_deadline)),
                 WakeHint::None,
             ),
             (
                 "absent without protocol deadline",
-                DesiredComputation::absent(None),
+                DesiredComputation::absent(None, AftrSource::Hb46pp),
                 WakeHint::None,
             ),
             (
                 "absent with protocol deadline",
-                DesiredComputation::absent(Some(deadline)),
+                DesiredComputation::absent(Some(deadline), AftrSource::Hb46pp),
                 WakeHint::Deadline(deadline),
             ),
             (
+                "unavailable with discovery disabled",
+                DesiredComputation::unavailable(None, AftrSource::None),
+                WakeHint::None,
+            ),
+            (
                 "unavailable without protocol deadline",
-                DesiredComputation::unavailable(None),
+                DesiredComputation::unavailable(None, AftrSource::Hb46pp),
                 WakeHint::GenericRetry,
             ),
             (
                 "unavailable with protocol deadline",
-                DesiredComputation::unavailable(Some(deadline)),
+                DesiredComputation::unavailable(Some(deadline), AftrSource::Hb46pp),
                 WakeHint::Deadline(deadline),
             ),
             (
                 "unavailable with expired deadline",
-                DesiredComputation::unavailable(Some(expired_deadline)),
+                DesiredComputation::unavailable(Some(expired_deadline), AftrSource::Hb46pp),
                 WakeHint::None,
             ),
         ];

@@ -1,0 +1,43 @@
+[Unit]
+Description=DS-Lite B4 tunnel management daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStartPre=/usr/sbin/dslite-b4 check-config
+ExecStart=/usr/sbin/dslite-b4 run
+RuntimeDirectory=dslite-b4
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+Restart=on-failure
+RestartSec=5s
+StandardOutput=null
+StandardError=journal
+User=root
+Group=root
+UMask=0022
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

@@ -3,11 +3,15 @@ use std::num::{NonZeroU8, NonZeroU64};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
+use thiserror::Error;
 
 use crate::tunnel::EncapsulationLimit;
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
     pub tunnel: TunnelConfig,
@@ -17,7 +21,38 @@ pub struct Config {
     pub health: HealthConfig,
 }
 
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub level: LogLevel,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     #[serde(
         default = "default_tunnel_name",
@@ -46,10 +81,9 @@ where
     // - .1 (AFTR element)
     // - .7 (broadcast)
     if o[..3] != [192, 0, 0] || !(2..=6).contains(&o[3]) {
-        return Err(serde::de::Error::custom(format!(
-            "according to RFC 6333 tunnel.local_v4 must be in 192.0.0.0/29 host range (192.0.0.2..192.0.0.6), got {}",
-            addr
-        )));
+        return Err(serde::de::Error::custom(
+            "according to RFC 6333 tunnel.local_v4 must be in the host range 192.0.0.2 through 192.0.0.6",
+        ));
     }
     Ok(addr)
 }
@@ -138,9 +172,9 @@ where
         EncapsulationLimitRepr::Keyword(s) if s == "disabled" => {
             Ok(Some(EncapsulationLimit::Disabled))
         }
-        EncapsulationLimitRepr::Keyword(s) => Err(serde::de::Error::custom(format!(
-            "accepted values are an integer from 1 through 255 or 'disabled', got: '{s}'"
-        ))),
+        EncapsulationLimitRepr::Keyword(_) => Err(serde::de::Error::custom(
+            "encapsulation_limit must be an integer from 1 through 255 or 'disabled'",
+        )),
     }
 }
 
@@ -162,6 +196,7 @@ impl From<String> for AftrAddress {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct AftrConfig {
     pub address: Option<AftrAddress>,
 }
@@ -175,6 +210,7 @@ pub enum DiscoveryMethod {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     #[serde(default)]
     pub method: DiscoveryMethod,
@@ -195,6 +231,7 @@ impl Default for DiscoveryConfig {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     #[serde(default = "default_health_interval")]
     pub interval_secs: NonZeroU64,
@@ -203,6 +240,7 @@ pub struct HealthConfig {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_runtime_state_dir")]
     pub state_dir: PathBuf,
@@ -214,6 +252,44 @@ impl Default for RuntimeConfig {
             state_dir: default_runtime_state_dir(),
         }
     }
+}
+
+/// Configuration diagnostic safe for supervisor logs.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigParseError {
+    #[error("invalid configuration at line {line}, column {column}")]
+    Located { line: usize, column: usize },
+    #[error("invalid configuration")]
+    Unlocated,
+}
+
+/// Parses configuration without including source lines or values in errors.
+pub fn parse(text: &str) -> Result<Config, ConfigParseError> {
+    toml::from_str(text).map_err(|error| match error.span() {
+        Some(span) => {
+            let (line, column) = line_column(text, span.start);
+            ConfigParseError::Located { line, column }
+        }
+        None => ConfigParseError::Unlocated,
+    })
+}
+
+/// Parses configuration with the original TOML diagnostic, which may contain
+/// source lines and values.
+pub fn parse_with_source(text: &str) -> Result<Config, toml::de::Error> {
+    toml::from_str(text)
+}
+
+fn line_column(text: &str, byte_offset: usize) -> (usize, usize) {
+    let prefix = &text.as_bytes()[..byte_offset.min(text.len())];
+    let line = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
+    let column = prefix
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte != b'\n')
+        .count()
+        + 1;
+    (line, column)
 }
 
 fn default_tunnel_name() -> String {
@@ -229,6 +305,9 @@ fn default_tunnel_local_v4() -> Ipv4Addr {
 }
 
 fn default_runtime_state_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    return PathBuf::from("/run/dslite-b4");
+    #[cfg(target_os = "illumos")]
     PathBuf::from("/var/run/dslite-b4")
 }
 
@@ -247,6 +326,25 @@ fn default_discovery_product() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_logging_levels_and_defaults_to_info() {
+        let default: LoggingConfig = toml::from_str("").unwrap();
+        assert_eq!(default.level, LogLevel::Info);
+
+        for (name, expected) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            let config: LoggingConfig = toml::from_str(&format!(r#"level = "{name}""#)).unwrap();
+            assert_eq!(config.level, expected);
+        }
+
+        assert!(toml::from_str::<LoggingConfig>(r#"level = "verbose""#).is_err());
+    }
 
     #[test]
     fn parses_encapsulation_limit() {

@@ -1,5 +1,6 @@
 pub mod aftr;
 pub mod aftr_discovery;
+pub(crate) mod atomic_file;
 pub mod config;
 pub mod discovery;
 pub mod dns;
@@ -8,6 +9,8 @@ pub mod hb46pp;
 pub mod lifecycle;
 pub mod network_changes;
 pub mod runtime_state;
+pub mod status;
+pub mod supervisor;
 pub mod tunnel;
 
 #[cfg(not(any(target_os = "linux", target_os = "illumos")))]
