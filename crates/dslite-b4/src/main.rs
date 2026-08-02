@@ -176,18 +176,26 @@ async fn run<B: TunnelBackend>(
                 result = network_changes.next_batch() => {
                     result?;
 
-                    if network_change_requires_reconciliation(
+                    match network_change_action(
                         &backend,
                         &computation.desired,
                         config.tunnel.local_v6.is_none(),
                     )
                     .await?
                     {
-                        tracing::debug!("network change requires reconciliation");
-                        break;
+                        NetworkChangeAction::Ignore => {
+                            tracing::trace!("network change does not require reconciliation");
+                        }
+                        NetworkChangeAction::Reconcile => {
+                            tracing::debug!("network change requires reconciliation");
+                            break;
+                        }
+                        NetworkChangeAction::RefreshDiscovery => {
+                            tracing::debug!("network change requires discovery refresh");
+                            discovery.invalidate();
+                            break;
+                        }
                     }
-
-                    tracing::trace!("network change does not require reconciliation");
                 }
                 _ = sigusr1.recv() => {
                     tracing::debug!("runtime state refresh requested");
@@ -323,38 +331,57 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
     toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
 }
 
-/// Checks whether network notifications justify a full reconciliation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkChangeAction {
+    Ignore,
+    Reconcile,
+    RefreshDiscovery,
+}
+
+/// Classifies the action required after network notifications.
 ///
 /// Tunnel drift always requires reconciliation. When the local IPv6 address
-/// is selected automatically, a changed kernel source address also requires
-/// reconciliation. A source selection failure is treated conservatively.
-async fn network_change_requires_reconciliation<B: TunnelBackend>(
+/// is selected automatically, a changed kernel source address requires a
+/// discovery refresh. A source selection failure requires reconciliation.
+async fn network_change_action<B: TunnelBackend>(
     backend: &B,
     desired: &Desired,
     local_v6_is_automatic: bool,
-) -> anyhow::Result<bool> {
-    let Desired::Resolved(desired_state) = desired else {
-        return Ok(true);
-    };
+) -> anyhow::Result<NetworkChangeAction> {
     let observed = backend.observe().await?;
 
-    if !matches!(lifecycle::plan(&observed, desired), lifecycle::Plan::Noop) {
-        return Ok(true);
-    }
+    let tunnel_matches_desired =
+        matches!(lifecycle::plan(&observed, desired), lifecycle::Plan::Noop);
 
-    if !local_v6_is_automatic {
-        return Ok(false);
-    }
-
-    match discover_local_v6(desired_state.remote_v6) {
-        Ok(local_v6) => Ok(local_v6 != desired_state.local_v6),
-        Err(error) => {
-            tracing::debug!(
-                error = %error,
-                "local IPv6 selection unavailable after network change"
-            );
-            Ok(true)
+    let desired_state = match desired {
+        Desired::Resolved(state) => state,
+        Desired::Absent if tunnel_matches_desired => {
+            return Ok(NetworkChangeAction::Ignore);
         }
+        Desired::Absent | Desired::Unavailable => {
+            return Ok(NetworkChangeAction::Reconcile);
+        }
+    };
+
+    if local_v6_is_automatic {
+        match discover_local_v6(desired_state.remote_v6) {
+            Ok(local_v6) if local_v6 != desired_state.local_v6 => {
+                return Ok(NetworkChangeAction::RefreshDiscovery);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "local IPv6 selection unavailable after network change"
+                );
+                return Ok(NetworkChangeAction::Reconcile);
+            }
+        }
+    }
+    if tunnel_matches_desired {
+        Ok(NetworkChangeAction::Ignore)
+    } else {
+        Ok(NetworkChangeAction::Reconcile)
     }
 }
 
@@ -459,10 +486,45 @@ mod tests {
             observed: Observed::Absent,
         };
 
-        assert!(
-            network_change_requires_reconciliation(&backend, &Desired::Unavailable, false)
+        assert_eq!(
+            network_change_action(&backend, &Desired::Unavailable, false)
                 .await
-                .unwrap()
+                .unwrap(),
+            NetworkChangeAction::Reconcile
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_is_ignored_when_desired_is_absent() {
+        let backend = FakeBackend {
+            observed: Observed::Absent,
+        };
+
+        assert_eq!(
+            network_change_action(&backend, &Desired::Absent, false)
+                .await
+                .unwrap(),
+            NetworkChangeAction::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_reconciles_tunnel_when_desired_is_absent() {
+        let backend = FakeBackend {
+            observed: Observed::Present {
+                local_v6: Ipv6Addr::LOCALHOST,
+                remote_v6: Ipv6Addr::LOCALHOST,
+                mtu: 1452,
+                encapsulation_limit: None,
+                admin_up: true,
+            },
+        };
+
+        assert_eq!(
+            network_change_action(&backend, &Desired::Absent, false)
+                .await
+                .unwrap(),
+            NetworkChangeAction::Reconcile
         );
     }
 
@@ -473,10 +535,11 @@ mod tests {
         };
         let desired = Desired::Resolved(test_desired_state());
 
-        assert!(
-            network_change_requires_reconciliation(&backend, &desired, false)
+        assert_eq!(
+            network_change_action(&backend, &desired, false)
                 .await
-                .unwrap()
+                .unwrap(),
+            NetworkChangeAction::Reconcile
         );
     }
 
@@ -494,10 +557,11 @@ mod tests {
         };
         let desired = Desired::Resolved(desired_state);
 
-        assert!(
-            !network_change_requires_reconciliation(&backend, &desired, false)
+        assert_eq!(
+            network_change_action(&backend, &desired, false)
                 .await
-                .unwrap()
+                .unwrap(),
+            NetworkChangeAction::Ignore
         );
     }
 }

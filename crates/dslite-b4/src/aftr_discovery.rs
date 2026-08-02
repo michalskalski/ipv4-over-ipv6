@@ -296,6 +296,17 @@ impl DiscoveryRuntime {
             DiscoveryRuntimeKind::Hb46pp(runtime) => runtime.discover_aftr().await,
         }
     }
+
+    /// Allows the next call to start a fresh discovery attempt.
+    pub fn invalidate(&mut self) {
+        match &mut self.kind {
+            DiscoveryRuntimeKind::None => {}
+            #[cfg(feature = "hb46pp")]
+            DiscoveryRuntimeKind::Hb46pp(runtime) => {
+                runtime.retained = None;
+            }
+        }
+    }
 }
 
 #[cfg(feature = "hb46pp")]
@@ -359,6 +370,30 @@ mod tests {
 
         assert!(retained.is_active(now));
         assert!(!retained.is_active(retained.next_attempt_at));
+    }
+
+    #[cfg(feature = "hb46pp")]
+    #[test]
+    fn invalidation_clears_retained_result_but_preserves_token() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let mut discovery = DiscoveryRuntime::from_config(&hb46pp_discovery_config()).unwrap();
+        let DiscoveryRuntimeKind::Hb46pp(runtime) = &mut discovery.kind else {
+            unreachable!();
+        };
+        runtime.request.set_token(Some(TOKEN.parse().unwrap()));
+        runtime.retained = Some(RetainedDiscovery {
+            state: DiscoveryState::Unavailable,
+            next_attempt_at: Instant::now() + Duration::from_secs(60),
+        });
+
+        discovery.invalidate();
+
+        let DiscoveryRuntimeKind::Hb46pp(runtime) = &discovery.kind else {
+            unreachable!();
+        };
+        assert!(runtime.retained.is_none());
+        assert_eq!(runtime.request.token(), Some(TOKEN));
     }
 
     #[cfg(not(feature = "hb46pp"))]
