@@ -5,6 +5,7 @@ edition = "2024"
 description = "DS-Lite B4 tunnel management daemon"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/michalskalski/ipv4-over-ipv6"
+keywords = ["dslite", "ipv4-over-ipv6", "networking", "linux", "illumos"]
 
 [features]
 default = ["hb46pp"]
@@ -29,7 +30,7 @@ libc = "0.2.186"
 jiff = { version = "0.2", features = ["serde"] }
 serde_json = "1"
 hb46pp = {
-    version = "0.1.1",
+    version = "0.1.2",
     path = "../hb46pp",
     optional = true,
     default-features = false,

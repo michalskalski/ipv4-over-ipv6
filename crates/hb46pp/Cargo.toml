@@ -1,6 +1,6 @@
 [package]
 name = "hb46pp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Client library for the HTTP-Based IPv4 over IPv6 Provisioning Protocol"
 license = "MIT OR Apache-2.0"
