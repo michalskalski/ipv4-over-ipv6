@@ -12,7 +12,9 @@ JSON. Applications select a method and interpret its parameters.
 ## Example
 
 The default features provide a [Hickory][hickory] DNS resolver and a
-[Reqwest][reqwest] HTTP transport:
+[Reqwest][reqwest] HTTP transport. Each HTTP request has a total timeout of 30
+seconds by default. Callers can override it with
+`DefaultClient::try_new_with_request_timeout`:
 
 ```rust
 # #[cfg(feature = "default-client")]

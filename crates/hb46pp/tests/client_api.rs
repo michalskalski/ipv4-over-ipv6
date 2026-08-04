@@ -1,5 +1,7 @@
 #![cfg(feature = "client")]
 
+#[cfg(any(feature = "default-client", feature = "default-transport"))]
+use std::time::Duration;
 use std::{
     convert::Infallible,
     future::{self, Future},
@@ -77,8 +79,11 @@ fn downstream_crates_can_inspect_next_attempt_window() {
 #[test]
 fn downstream_crates_can_construct_the_default_client() {
     let constructor: fn() -> Result<DefaultClient, DefaultClientError> = DefaultClient::try_new;
+    let timeout_constructor: fn(Duration) -> Result<DefaultClient, DefaultClientError> =
+        DefaultClient::try_new_with_request_timeout;
 
     let _ = constructor;
+    let _ = timeout_constructor;
 }
 
 #[cfg(feature = "default-resolver")]
@@ -95,6 +100,10 @@ fn downstream_crates_can_use_the_default_transport() {
     fn accepts_transport_type<T: Transport>() {}
 
     accepts_transport_type::<DefaultTransport>();
+
+    let timeout_constructor: fn(Duration) -> Result<DefaultTransport, reqwest::Error> =
+        DefaultTransport::new_with_request_timeout;
+    let _ = timeout_constructor;
 }
 
 #[test]

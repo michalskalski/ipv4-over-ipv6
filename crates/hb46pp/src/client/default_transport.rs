@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use reqwest::header;
 
@@ -7,6 +7,7 @@ use crate::TlsPolicy;
 use super::{Transport, TransportRequest, TransportResponse};
 
 const MAX_ACCEPTED_RESPONSE_BODY_SIZE: usize = 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors returned by [`DefaultTransport`].
 #[derive(Debug, thiserror::Error)]
@@ -46,10 +47,23 @@ pub struct DefaultTransport {
 
 impl DefaultTransport {
     /// Creates a transport with clients for both HB46PP TLS policies.
+    ///
+    /// Each HTTP request has a total timeout of 30 seconds. Use
+    /// [`Self::new_with_request_timeout`] to select a different timeout.
     pub fn new() -> Result<Self, reqwest::Error> {
+        Self::new_with_request_timeout(DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Creates a transport with the supplied total timeout for each HTTP
+    /// request.
+    ///
+    /// The timeout covers connection establishment, receiving the response,
+    /// and reading its body. It applies separately to every request after an
+    /// HB46PP redirect.
+    pub fn new_with_request_timeout(request_timeout: Duration) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            validated_client: build_http_client(false)?,
-            unvalidated_client: build_http_client(true)?,
+            validated_client: build_http_client(false, request_timeout)?,
+            unvalidated_client: build_http_client(true, request_timeout)?,
         })
     }
 }
@@ -165,8 +179,12 @@ fn ipv6_addresses(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<Socket
     addresses.into_iter().filter(SocketAddr::is_ipv6).collect()
 }
 
-fn build_http_client(accept_invalid_certificates: bool) -> Result<reqwest::Client, reqwest::Error> {
+fn build_http_client(
+    accept_invalid_certificates: bool,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
+        .timeout(request_timeout)
         // Redirect validation and policy are handled by the HB46PP client.
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -300,6 +318,27 @@ mod tests {
             result,
             Err(DefaultTransportError::Ipv4EndpointNotAllowed)
         ));
+    }
+
+    #[tokio::test]
+    async fn configured_request_timeout_bounds_a_stalled_response() {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = url::Url::parse(&format!("http://{address}/provision")).unwrap();
+        let transport =
+            DefaultTransport::new_with_request_timeout(Duration::from_millis(20)).unwrap();
+        let request = TransportRequest::new(endpoint, TlsPolicy::NoCertificateValidation);
+
+        let result = transport.send_once(request).await;
+        server.abort();
+
+        assert!(matches!(result, Err(DefaultTransportError::Request(error)) if error.is_timeout()));
     }
 
     #[test]

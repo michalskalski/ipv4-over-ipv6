@@ -409,9 +409,22 @@ pub enum DefaultClientError {
 #[cfg(feature = "default-client")]
 impl Client<DefaultDiscoveryResolver, DefaultTransport> {
     /// Creates a client using the default DNS resolver and HTTP transport.
+    ///
+    /// Each provisioning HTTP request has a total timeout of 30 seconds.
     pub fn try_new() -> Result<Self, DefaultClientError> {
         let resolver = DefaultDiscoveryResolver::new()?;
         let transport = DefaultTransport::new()?;
+
+        Ok(Self::new(resolver, transport))
+    }
+
+    /// Creates a client using the default DNS resolver and HTTP transport with
+    /// the supplied total timeout for each provisioning HTTP request.
+    pub fn try_new_with_request_timeout(
+        request_timeout: Duration,
+    ) -> Result<Self, DefaultClientError> {
+        let resolver = DefaultDiscoveryResolver::new()?;
+        let transport = DefaultTransport::new_with_request_timeout(request_timeout)?;
 
         Ok(Self::new(resolver, transport))
     }
