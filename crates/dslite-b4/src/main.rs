@@ -208,13 +208,36 @@ fn wake_hint_for_deadline(next_attempt_at: Option<Instant>, no_deadline: WakeHin
     }
 }
 
+#[derive(Debug)]
+enum ShutdownReason {
+    Sigint,
+    Sigterm,
+}
+
+struct ShutdownSignals {
+    sigint: signal::unix::Signal,
+    sigterm: signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    async fn recv(&mut self) -> ShutdownReason {
+        tokio::select! {
+            _ = self.sigint.recv() => ShutdownReason::Sigint,
+            _ = self.sigterm.recv() => ShutdownReason::Sigterm,
+        }
+    }
+}
+
 async fn run<B: TunnelBackend>(
     backend: B,
     config: &Config,
     mut discovery: DiscoveryRuntime,
     mut pidfile: PidFile,
 ) -> anyhow::Result<()> {
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let mut shutdown = ShutdownSignals {
+        sigint: signal::unix::signal(signal::unix::SignalKind::interrupt())?,
+        sigterm: signal::unix::signal(signal::unix::SignalKind::terminate())?,
+    };
     let mut sigusr1 = signal::unix::signal(signal::unix::SignalKind::user_defined1())?;
     let mut network_changes = NetworkChanges::new()?;
     pidfile.mark_ready()?;
@@ -224,8 +247,25 @@ async fn run<B: TunnelBackend>(
     'reconcile: loop {
         let observed = backend.observe().await?;
         let current_aftr = current_aftr(&observed);
-        let computation =
-            compute_desired(config, &mut discovery, &mut aftr_selector, current_aftr).await?;
+
+        // Desired state computation is safe to cancel while waiting on
+        // discovery, unlike the state changing reconciliation below.
+        let computation = tokio::select! {
+            biased;
+
+            reason = shutdown.recv() => {
+                tracing::info!(?reason, "shutdown requested");
+                break 'reconcile;
+            }
+            result = compute_desired(
+                config,
+                &mut discovery,
+                &mut aftr_selector,
+                current_aftr,
+            ) => result?,
+        };
+
+        // Let a started tunnel mutation reach a consistent stopping point.
         let action = reconcile_once(&backend, &observed, &computation.desired).await?;
         match action {
             lifecycle::Plan::Keep | lifecycle::Plan::Noop => {
@@ -270,6 +310,17 @@ async fn run<B: TunnelBackend>(
         // batch so event noise cannot postpone scheduled reconciliation.
         loop {
             tokio::select! {
+                biased;
+
+                reason = shutdown.recv() => {
+                    tracing::info!(?reason, "shutdown requested");
+                    break 'reconcile;
+                }
+                _ = sigusr1.recv() => {
+                    tracing::debug!("runtime state refresh requested");
+                    attempt = 0;
+                    break;
+                },
                 _ = tokio::time::sleep_until(scheduled.at.into()) => break,
                 result = network_changes.next_batch() => {
                     result?;
@@ -295,13 +346,6 @@ async fn run<B: TunnelBackend>(
                         }
                     }
                 }
-                _ = sigusr1.recv() => {
-                    tracing::debug!("runtime state refresh requested");
-                    attempt = 0;
-                    break;
-                },
-                _ = signal::ctrl_c() => break 'reconcile,
-                _ = sigterm.recv() => break 'reconcile,
             }
         }
     }
