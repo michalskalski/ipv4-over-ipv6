@@ -18,6 +18,8 @@ pub use default_transport::{DefaultTransport, DefaultTransportError};
 
 const DISCOVERY_NAME: &str = "4over6.info.";
 const DEFAULT_MAX_REDIRECTS: usize = 10;
+#[cfg(feature = "default-transport")]
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_NOT_FOUND_MIN: Duration = Duration::from_secs(60 * 60);
 const DISCOVERY_NOT_FOUND_MAX: Duration = Duration::from_secs(3 * 60 * 60);
 const DISCOVERY_FAILURE_MIN: Duration = Duration::from_secs(60);
@@ -26,6 +28,19 @@ const PROVISIONING_FAILURE_MIN: Duration = Duration::from_secs(10 * 60);
 const PROVISIONING_FAILURE_MAX: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_REFRESH_MIN: Duration = Duration::from_secs(20 * 60 * 60);
 const DEFAULT_REFRESH_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Controls whether an HB46PP client accepts unauthenticated provisioning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProvisioningAuthenticationPolicy {
+    /// Require bootstrap policy `t=b`, which uses HTTPS with certificate
+    /// validation.
+    #[default]
+    RequireCertificateValidation,
+    /// Permit bootstrap policy `t=a`, which uses HTTP or HTTPS without
+    /// certificate validation.
+    AllowUnauthenticated,
+}
 
 /// The interval in which HB46PP recommends making another provisioning attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +335,10 @@ pub enum ClientError {
     /// The discovered TXT record was not a valid HB46PP bootstrap record.
     #[error("invalid bootstrap TXT record")]
     Bootstrap(#[source] BootstrapError),
+    /// The bootstrap record disabled certificate validation, but the client
+    /// requires authenticated provisioning.
+    #[error("bootstrap TXT record permits unauthenticated provisioning")]
+    UnauthenticatedProvisioningNotAllowed,
     /// The validated bootstrap and provisioning parameters could not produce
     /// a permitted request URL.
     #[error("failed to construct provisioning URL")]
@@ -353,12 +372,11 @@ impl ClientError {
                 DISCOVERY_FAILURE_MIN,
                 DISCOVERY_FAILURE_MAX,
             ))),
-            Self::UnexpectedRecordCount(_) | Self::Bootstrap(_) => {
-                Some(RetryAction::DisableMigration(NextAttemptWindow::new(
-                    DISCOVERY_NOT_FOUND_MIN,
-                    DISCOVERY_NOT_FOUND_MAX,
-                )))
-            }
+            Self::UnexpectedRecordCount(_)
+            | Self::Bootstrap(_)
+            | Self::UnauthenticatedProvisioningNotAllowed => Some(RetryAction::DisableMigration(
+                NextAttemptWindow::new(DISCOVERY_NOT_FOUND_MIN, DISCOVERY_NOT_FOUND_MAX),
+            )),
             Self::Transport(_)
             | Self::ResponseEncoding(_)
             | Self::ProvisioningData(_)
@@ -386,6 +404,7 @@ pub struct Client<R, T> {
     resolver: R,
     transport: T,
     max_redirects: usize,
+    authentication_policy: ProvisioningAuthenticationPolicy,
 }
 
 /// An HB46PP client using the default DNS resolver and HTTP transport.
@@ -406,27 +425,74 @@ pub enum DefaultClientError {
     Transport(#[from] reqwest::Error),
 }
 
+/// Configures and constructs a [`DefaultClient`].
 #[cfg(feature = "default-client")]
-impl Client<DefaultDiscoveryResolver, DefaultTransport> {
-    /// Creates a client using the default DNS resolver and HTTP transport.
-    ///
-    /// Each provisioning HTTP request has a total timeout of 30 seconds.
-    pub fn try_new() -> Result<Self, DefaultClientError> {
-        let resolver = DefaultDiscoveryResolver::new()?;
-        let transport = DefaultTransport::new()?;
+pub struct DefaultClientBuilder {
+    request_timeout: Duration,
+    max_redirects: usize,
+    authentication_policy: ProvisioningAuthenticationPolicy,
+}
 
-        Ok(Self::new(resolver, transport))
+#[cfg(feature = "default-client")]
+impl Default for DefaultClientBuilder {
+    fn default() -> Self {
+        Self {
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            authentication_policy: ProvisioningAuthenticationPolicy::default(),
+        }
+    }
+}
+
+#[cfg(feature = "default-client")]
+impl DefaultClientBuilder {
+    /// Sets the total timeout for each provisioning HTTP request.
+    pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
-    /// Creates a client using the default DNS resolver and HTTP transport with
-    /// the supplied total timeout for each provisioning HTTP request.
-    pub fn try_new_with_request_timeout(
-        request_timeout: Duration,
-    ) -> Result<Self, DefaultClientError> {
-        let resolver = DefaultDiscoveryResolver::new()?;
-        let transport = DefaultTransport::new_with_request_timeout(request_timeout)?;
+    /// Sets the maximum number of redirects the client will follow.
+    ///
+    /// A value of zero rejects the first redirect. There is no value that
+    /// disables the redirect limit.
+    pub fn max_redirects(mut self, limit: usize) -> Self {
+        self.max_redirects = limit;
+        self
+    }
 
-        Ok(Self::new(resolver, transport))
+    /// Sets whether unauthenticated HB46PP provisioning is accepted.
+    pub fn authentication_policy(mut self, policy: ProvisioningAuthenticationPolicy) -> Self {
+        self.authentication_policy = policy;
+        self
+    }
+
+    /// Constructs a client using the configured default DNS resolver and HTTP
+    /// transport.
+    pub fn build(self) -> Result<DefaultClient, DefaultClientError> {
+        let resolver = DefaultDiscoveryResolver::new()?;
+        let transport = DefaultTransport::new_with_request_timeout(self.request_timeout)?;
+
+        Ok(Client::new(resolver, transport)
+            .with_max_redirects(self.max_redirects)
+            .with_authentication_policy(self.authentication_policy))
+    }
+}
+
+#[cfg(feature = "default-client")]
+impl Client<DefaultDiscoveryResolver, DefaultTransport> {
+    /// Returns a builder for a client using the default DNS resolver and HTTP
+    /// transport.
+    pub fn builder() -> DefaultClientBuilder {
+        DefaultClientBuilder::default()
+    }
+
+    /// Creates a client using the default DNS resolver and HTTP transport.
+    ///
+    /// Each provisioning HTTP request has a total timeout of 30 seconds, and
+    /// unauthenticated provisioning is rejected.
+    pub fn try_new() -> Result<Self, DefaultClientError> {
+        Self::builder().build()
     }
 }
 
@@ -441,6 +507,7 @@ where
             resolver,
             transport,
             max_redirects: DEFAULT_MAX_REDIRECTS,
+            authentication_policy: ProvisioningAuthenticationPolicy::default(),
         }
     }
 
@@ -450,6 +517,12 @@ where
     /// disables the redirect limit.
     pub fn with_max_redirects(mut self, limit: usize) -> Self {
         self.max_redirects = limit;
+        self
+    }
+
+    /// Sets whether unauthenticated HB46PP provisioning is accepted.
+    pub fn with_authentication_policy(mut self, policy: ProvisioningAuthenticationPolicy) -> Self {
+        self.authentication_policy = policy;
         self
     }
 
@@ -468,9 +541,15 @@ where
                     return Err(ClientError::UnexpectedRecordCount(records.len()));
                 };
 
-                Bootstrap::parse(record)
-                    .map(Some)
-                    .map_err(ClientError::Bootstrap)
+                let bootstrap = Bootstrap::parse(record).map_err(ClientError::Bootstrap)?;
+                if bootstrap.tls_policy() == TlsPolicy::NoCertificateValidation
+                    && self.authentication_policy
+                        == ProvisioningAuthenticationPolicy::RequireCertificateValidation
+                {
+                    return Err(ClientError::UnauthenticatedProvisioningNotAllowed);
+                }
+
+                Ok(Some(bootstrap))
             }
         }
     }
@@ -1100,6 +1179,43 @@ mod tests {
 
         assert!(
             matches!(result, Err(ClientError::UnexpectedResponseStatus(500))),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_unauthenticated_bootstrap_by_default() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=https://example.com/provision t=a"]),
+            UnexpectedCallTransport,
+        );
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::UnauthenticatedProvisioningNotAllowed)
+            ),
+            "result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_allows_unauthenticated_bootstrap_when_configured() {
+        let client = Client::new(
+            RecordsResolver(&["v=v6mig-1 url=http://example.com/provision t=a"]),
+            StaticResponseTransport {
+                status: 200,
+                body: br#"{"enabler_name":"example","order":[]}"#,
+            },
+        )
+        .with_authentication_policy(ProvisioningAuthenticationPolicy::AllowUnauthenticated);
+
+        let result = client.provision(&valid_request()).await;
+
+        assert!(
+            matches!(result, Ok(ProvisioningOutcome::Provisioned(_))),
             "result: {result:?}"
         );
     }

@@ -27,6 +27,9 @@ address = "2001:db8::2"
 # method = "hb46pp"
 # vendor_id = "000000"
 # product = "dslite-b4"
+# Allows HB46PP t=a: HTTP or HTTPS without certificate validation.
+# Enable only when required by the provider. Defaults to false.
+# allow_unauthenticated = true
 
 [health]
 # Periodic reconciliation interval. Network-change and runtime-state hints wake sooner.

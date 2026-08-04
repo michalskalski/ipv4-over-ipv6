@@ -12,9 +12,9 @@ JSON. Applications select a method and interpret its parameters.
 ## Example
 
 The default features provide a [Hickory][hickory] DNS resolver and a
-[Reqwest][reqwest] HTTP transport. Each HTTP request has a total timeout of 30
-seconds by default. Callers can override it with
-`DefaultClient::try_new_with_request_timeout`:
+[Reqwest][reqwest] HTTP transport with a total timeout of 30 seconds per
+provisioning request. `DefaultClient::try_new` uses the default client settings,
+but callers can customize them with `DefaultClient::builder`.
 
 ```rust
 # #[cfg(feature = "default-client")]
@@ -77,6 +77,19 @@ application.
 
 Custom transports must use IPv6, apply the requested TLS policy, avoid
 automatic redirects, and bound response resource usage.
+
+## Security
+
+HB46PP bootstrap discovery trusts the DNS response for `4over6.info`. Requiring
+certificate validation protects communication with the hostname in that
+response, but does not independently authenticate that DNS selected the
+intended provider. Applications should use HB46PP discovery only where the
+access-network DNS is trusted.
+
+The client rejects bootstrap policy `t=a` by default because it permits HTTP or
+HTTPS without certificate validation. Applications that require compatibility
+with such a provider must explicitly select
+`ProvisioningAuthenticationPolicy::AllowUnauthenticated`.
 
 ## License
 

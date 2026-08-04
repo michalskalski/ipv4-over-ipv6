@@ -4,10 +4,9 @@ use reqwest::header;
 
 use crate::TlsPolicy;
 
-use super::{Transport, TransportRequest, TransportResponse};
+use super::{DEFAULT_REQUEST_TIMEOUT, Transport, TransportRequest, TransportResponse};
 
 const MAX_ACCEPTED_RESPONSE_BODY_SIZE: usize = 1024 * 1024;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors returned by [`DefaultTransport`].
 #[derive(Debug, thiserror::Error)]

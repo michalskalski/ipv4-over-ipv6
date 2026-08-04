@@ -218,6 +218,8 @@ pub struct DiscoveryConfig {
     pub vendor_id: String,
     #[serde(default = "default_discovery_product")]
     pub product: String,
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl Default for DiscoveryConfig {
@@ -226,6 +228,7 @@ impl Default for DiscoveryConfig {
             method: DiscoveryMethod::None,
             vendor_id: default_discovery_vendorid(),
             product: default_discovery_product(),
+            allow_unauthenticated: false,
         }
     }
 }
@@ -344,6 +347,20 @@ mod tests {
         }
 
         assert!(toml::from_str::<LoggingConfig>(r#"level = "verbose""#).is_err());
+    }
+
+    #[test]
+    fn unauthenticated_discovery_defaults_to_disabled() {
+        let config: DiscoveryConfig = toml::from_str("").unwrap();
+
+        assert!(!config.allow_unauthenticated);
+    }
+
+    #[test]
+    fn parses_unauthenticated_discovery_opt_in() {
+        let config: DiscoveryConfig = toml::from_str("allow_unauthenticated = true").unwrap();
+
+        assert!(config.allow_unauthenticated);
     }
 
     #[test]

@@ -237,6 +237,11 @@ impl DiscoveryRuntime {
     /// Validates that the selected discovery method is available and configured.
     pub fn validate_config(config: &DiscoveryConfig) -> anyhow::Result<()> {
         match config.method {
+            DiscoveryMethod::None if config.allow_unauthenticated => {
+                anyhow::bail!(
+                    "discovery.allow_unauthenticated requires discovery.method = 'hb46pp'"
+                )
+            }
             DiscoveryMethod::None => Ok(()),
             DiscoveryMethod::Hb46pp => Self::validate_hb46pp_config(config),
         }
@@ -268,7 +273,14 @@ impl DiscoveryRuntime {
     fn hb46pp(config: &DiscoveryConfig) -> anyhow::Result<Self> {
         let request =
             crate::hb46pp::provisioning_request(config).context("invalid HB46PP configuration")?;
-        let client = hb46pp::client::DefaultClient::try_new()
+        let authentication_policy = if config.allow_unauthenticated {
+            hb46pp::client::ProvisioningAuthenticationPolicy::AllowUnauthenticated
+        } else {
+            hb46pp::client::ProvisioningAuthenticationPolicy::RequireCertificateValidation
+        };
+        let client = hb46pp::client::DefaultClient::builder()
+            .authentication_policy(authentication_policy)
+            .build()
             .context("creating the default HB46PP client")?;
 
         Ok(Self {
@@ -325,6 +337,7 @@ mod tests {
             method: DiscoveryMethod::Hb46pp,
             vendor_id: "000000".into(),
             product: "dslite-b4".into(),
+            allow_unauthenticated: false,
         }
     }
 
@@ -345,6 +358,22 @@ mod tests {
         let result = DiscoveryRuntime::validate_config(&config);
 
         assert!(result.is_err(), "result: {result:?}");
+    }
+
+    #[test]
+    fn rejects_unauthenticated_opt_in_when_discovery_is_disabled() {
+        let config = DiscoveryConfig {
+            allow_unauthenticated: true,
+            ..DiscoveryConfig::default()
+        };
+
+        let result = DiscoveryRuntime::validate_config(&config);
+
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "discovery.allow_unauthenticated requires discovery.method = 'hb46pp'"
+        );
     }
 
     #[cfg(feature = "hb46pp")]

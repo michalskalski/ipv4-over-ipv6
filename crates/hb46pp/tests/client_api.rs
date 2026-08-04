@@ -12,11 +12,11 @@ use hb46pp::client::DefaultDiscoveryResolver;
 #[cfg(feature = "default-transport")]
 use hb46pp::client::DefaultTransport;
 use hb46pp::client::{
-    Client, ClientError, DiscoveryAnswer, DiscoveryResolver, ProvisioningOutcome, RetryAction,
-    Transport, TransportRequest, TransportResponse,
+    Client, ClientError, DiscoveryAnswer, DiscoveryResolver, ProvisioningAuthenticationPolicy,
+    ProvisioningOutcome, RetryAction, Transport, TransportRequest, TransportResponse,
 };
 #[cfg(feature = "default-client")]
-use hb46pp::client::{DefaultClient, DefaultClientError};
+use hb46pp::client::{DefaultClient, DefaultClientBuilder, DefaultClientError};
 
 struct FakeResolver;
 
@@ -65,7 +65,8 @@ fn downstream_crates_can_implement_discovery_resolver() {
 
 #[test]
 fn downstream_crates_can_construct_client() {
-    let _client = Client::new(FakeResolver, FakeTransport);
+    let _client = Client::new(FakeResolver, FakeTransport)
+        .with_authentication_policy(ProvisioningAuthenticationPolicy::AllowUnauthenticated);
 }
 
 #[test]
@@ -79,11 +80,13 @@ fn downstream_crates_can_inspect_next_attempt_window() {
 #[test]
 fn downstream_crates_can_construct_the_default_client() {
     let constructor: fn() -> Result<DefaultClient, DefaultClientError> = DefaultClient::try_new;
-    let timeout_constructor: fn(Duration) -> Result<DefaultClient, DefaultClientError> =
-        DefaultClient::try_new_with_request_timeout;
+    let builder_constructor: fn() -> DefaultClientBuilder = DefaultClient::builder;
 
     let _ = constructor;
-    let _ = timeout_constructor;
+    let _ = builder_constructor()
+        .request_timeout(Duration::from_secs(10))
+        .authentication_policy(ProvisioningAuthenticationPolicy::AllowUnauthenticated)
+        .max_redirects(2);
 }
 
 #[cfg(feature = "default-resolver")]

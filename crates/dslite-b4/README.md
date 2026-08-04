@@ -32,6 +32,12 @@ Validate a configuration before starting the daemon:
 dslite-b4 check-config
 ```
 
+HB46PP discovery accepts only provisioning servers using certificate validation
+(`t=b`) by default. Providers requiring `t=a` can be enabled explicitly with
+`discovery.allow_unauthenticated`, which permits HTTP or HTTPS without
+certificate validation. HB46PP still trusts the access-network DNS response to
+select the provisioning server hostname.
+
 ## License
 
 Licensed under either of the following:
