@@ -1,0 +1,19 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH dslite-b4-check-config 8  "check-config "
+.SH NAME
+dslite\-b4\-check\-config \- Validate configuration without changing network state
+.SH SYNOPSIS
+\fBdslite\-b4 check\-config\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-\-show\-source\fR] [\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+Validate configuration without changing network state
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR [default: /etc/dslite\-b4.toml]
+Read configuration from this path
+.TP
+\fB\-\-show\-source\fR
+Include the original TOML diagnostic. It may expose sensitive configuration values
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

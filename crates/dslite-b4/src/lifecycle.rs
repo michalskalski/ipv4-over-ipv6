@@ -1,24 +1,39 @@
+//! Pure reconciliation planning and backend action execution.
+
 use crate::tunnel::{
     DesiredState, EncapsulationLimit, Observed, TunnelBackend, TunnelError, TunnelUpdate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Desired tunnel availability used by reconciliation.
 pub enum Desired {
+    /// A complete desired tunnel state is available.
     Resolved(DesiredState),
+    /// The tunnel should not exist.
     Absent,
+    /// Desired state is temporarily unknown, so existing state is retained.
     Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Action required to reconcile observed and desired tunnel state.
 pub enum Plan {
+    /// Create a missing tunnel.
     Create(DesiredState),
+    /// Update mutable properties of an existing tunnel.
     Update {
+        /// Complete desired tunnel state.
         desired: DesiredState,
+        /// Mutable properties that differ.
         changes: TunnelUpdate,
     },
+    /// Recreate a tunnel whose immutable endpoints differ.
     Rebuild(DesiredState),
+    /// Remove an existing tunnel.
     Teardown,
+    /// Preserve existing state while desired state is unavailable.
     Keep,
+    /// Observed state already matches desired state.
     Noop,
 }
 
@@ -78,6 +93,7 @@ pub fn plan(observed: &Observed, desired: &Desired) -> Plan {
     }
 }
 
+/// Executes one reconciliation plan through `backend` and returns the action.
 pub async fn reconcile_once<B: TunnelBackend>(
     backend: &B,
     observed: &Observed,

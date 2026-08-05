@@ -1,5 +1,5 @@
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 #[cfg(target_os = "illumos")]
 use dslite_b4::tunnel::illumos::IllumosBackend;
 #[cfg(target_os = "linux")]
@@ -24,44 +24,16 @@ use dslite_b4::{
 };
 use std::{
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 use tokio::signal;
 
+mod cli;
 mod logging;
 mod wake;
+use cli::{Cli, Commands};
 use wake::{ScheduledWake, WakeHint, WakeReason, schedule_next_wake};
-
-#[derive(Parser)]
-#[command(name = "dslite-b4", about = "DS-Lite B4 tunnel manager")]
-struct Cli {
-    #[arg(short, long, default_value = "/etc/dslite-b4.toml", global = true)]
-    config: PathBuf,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Run,
-    CheckConfig {
-        /// Include the original TOML diagnostic. It may expose sensitive configuration values.
-        #[arg(long)]
-        show_source: bool,
-    },
-    SetAftr {
-        addr: String,
-    },
-    ClearAftr,
-    Status {
-        #[arg(long)]
-        json: bool,
-        #[arg(long, value_name = "PATH")]
-        state_dir: Option<PathBuf>,
-    },
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

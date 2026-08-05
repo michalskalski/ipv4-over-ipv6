@@ -1,0 +1,110 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH dslite-b4 8  "dslite-b4 0.1.1"
+.SH NAME
+dslite\-b4 \- Manage a DS Lite B4 tunnel on Linux or illumos
+.SH SYNOPSIS
+\fBdslite\-b4\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+.SH DESCRIPTION
+dslite\-b4 is a foreground daemon that provides the B4 function described by RFC 6333. It creates an IPv4 in IPv6 tunnel to an AFTR and continues to reconcile the tunnel interface, reserved B4 address, and IPv4 default route with configuration and operating system state. Packet forwarding and encapsulation remain in the operating system network stack.
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR [default: /etc/dslite\-b4.toml]
+Read configuration from this path
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+dslite\-b4\-run(8)
+Run the daemon and continue to reconcile tunnel state
+.TP
+dslite\-b4\-check\-config(8)
+Validate configuration without changing network state
+.TP
+dslite\-b4\-set\-aftr(8)
+Set the runtime AFTR override and ask the daemon to reconcile
+.TP
+dslite\-b4\-clear\-aftr(8)
+Clear the runtime AFTR override and ask the daemon to reconcile
+.TP
+dslite\-b4\-status(8)
+Show the last status snapshot written by the daemon
+.SH OPERATION
+Running
+.B dslite\-b4
+without a subcommand is equivalent to
+.BR "dslite\-b4 run" .
+The daemon runs in the foreground and requires effective user ID 0.
+It creates and manages the configured tunnel interface, assigns the reserved B4 IPv4 endpoint, and installs an IPv4 default route through the tunnel.
+On shutdown it removes the managed tunnel and its status snapshot.
+.SH AFTR SELECTION
+A static AFTR in the configuration takes precedence over an AFTR supplied at run time.
+The run time value takes precedence over automatic discovery.
+The selected DNS name is resolved to IPv6 addresses before reconciliation.
+.SH PRIVILEGES
+The
+.B run
+command requires effective user ID 0.
+On Linux, the supplied systemd service runs as root and limits its capability bounding set to
+.BR CAP_NET_ADMIN .
+On illumos, the supplied SMF service runs as root with the
+.BR basic ,
+.BR net_rawaccess ,
+.BR sys_ip_config ,
+.BR sys_dl_config ,
+and
+.B sys_iptun_config
+privileges.
+.PP
+The
+.B check\-config
+command needs no special privileges.
+The
+.B status
+command needs read access to the status snapshot.
+The
+.B set\-aftr
+and
+.B clear\-aftr
+commands need permission to modify the state directory and signal the daemon.
+With the supplied service configuration, this normally requires root.
+.SH SIGNALS
+.TP
+.B SIGINT, SIGTERM
+Stop the daemon, remove the managed tunnel, and remove the status snapshot.
+.TP
+.B SIGUSR1
+Read the run time AFTR state again and start a reconciliation pass.
+The
+.B set\-aftr
+and
+.B clear\-aftr
+commands send this signal to a running daemon.
+The configuration file is not read again.
+.SH FILES
+.TP
+.B /etc/dslite\-b4.toml
+Default configuration file.
+.TP
+.B /run/dslite\-b4
+Default Linux state directory.
+.TP
+.B /var/run/dslite\-b4
+Default illumos state directory.
+.PP
+The state directory contains the locked PID file, the optional run time AFTR value, and the JSON status snapshot.
+Its location can be changed with
+.BR runtime.state_dir .
+.SH SEE ALSO
+.BR dslite\-b4.toml (5),
+.BR dslite\-b4\-run (8),
+.BR dslite\-b4\-check\-config (8),
+.BR dslite\-b4\-set\-aftr (8),
+.BR dslite\-b4\-clear\-aftr (8),
+.BR dslite\-b4\-status (8)
+.SH VERSION
+v0.1.1

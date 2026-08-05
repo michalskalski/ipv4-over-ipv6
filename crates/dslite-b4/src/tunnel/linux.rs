@@ -1,3 +1,5 @@
+//! Linux netlink implementation of the tunnel backend.
+
 use crate::tunnel::{
     AFTR_V4_ELEMENT, B4_V4_PREFIX_LEN, DesiredState, EncapsulationLimit, Observed, TunnelBackend,
     TunnelError, TunnelUpdate,
@@ -82,11 +84,13 @@ fn observed_from_link(link: &LinkMessage) -> Result<Observed, TunnelError> {
     }
 }
 
+/// Linux backend managing one named IP6 tunnel through rtnetlink.
 pub struct LinuxBackend {
     name: String,
 }
 
 impl LinuxBackend {
+    /// Creates a backend for `name` without modifying network state.
     pub fn new(name: String) -> Self {
         Self { name }
     }

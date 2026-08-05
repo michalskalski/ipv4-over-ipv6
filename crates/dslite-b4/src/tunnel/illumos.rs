@@ -35,11 +35,13 @@ pub(crate) use sys::{
 // /29 -> 255.255.255.248
 const B4_V4_NETMASK: Ipv4Addr = Ipv4Addr::from_bits(u32::MAX << (32 - B4_V4_PREFIX_LEN));
 
+/// illumos backend managing one named temporary IP tunnel.
 pub struct IllumosBackend {
     cname: CString,
 }
 
 impl IllumosBackend {
+    /// Creates a backend for `name` without modifying network state.
     pub fn new(name: String) -> Result<Self, std::ffi::NulError> {
         let cname = std::ffi::CString::new(name)?;
 

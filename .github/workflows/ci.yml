@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo test -p hb46pp --no-default-features --locked
+      - run: cargo test -p hb46pp --no-default-features --features client --locked
+      - run: cargo test -p dslite-b4 --no-default-features --locked
+
+  msrv:
+    name: Rust 1.89
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          toolchain: 1.89.0
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo check -p hb46pp --no-default-features --locked
+      - run: cargo check -p hb46pp --no-default-features --features client --locked
+      - run: cargo check -p dslite-b4 --no-default-features --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  docs-package:
+    name: Docs and packages
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+      - run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Check manual page
+        run: |
+          cargo run -p dslite-b4 --example generate-man --locked -- /tmp/dslite-b4-man
+          diff -ru crates/dslite-b4/packaging/man/generated /tmp/dslite-b4-man
+      - run: cargo package -p hb46pp --locked
+      - run: cargo package -p dslite-b4 --locked
+
+  illumos:
+    name: Check illumos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          target: x86_64-unknown-illumos
+      - run: cargo check -p hb46pp --no-default-features --locked --target x86_64-unknown-illumos
+      - run: cargo check -p hb46pp --no-default-features --features client --locked --target x86_64-unknown-illumos
+      - run: cargo check -p dslite-b4 --no-default-features --locked --target x86_64-unknown-illumos

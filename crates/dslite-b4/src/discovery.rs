@@ -1,3 +1,5 @@
+//! Discovery of the local IPv6 source address.
+
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 
 use std::io;
@@ -5,18 +7,24 @@ use std::io::ErrorKind;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+/// Failures while asking the kernel to select a local IPv6 endpoint.
 pub enum DiscoveryError {
     #[error("no default IPv6 route available")]
+    /// The host has no usable default IPv6 route.
     NoV6Connectivity,
     #[error("only link local addr available: {0}")]
+    /// Source selection returned only a link local address.
     LinkLocalOnly(Ipv6Addr),
     #[error("unexpected route address family")]
+    /// The connected socket unexpectedly returned an address that is not IPv6.
     UnsupportedAddressFamily,
     #[error("ipv6 socket error: {0}")]
+    /// Socket creation, connection, or inspection failed.
     Socket(io::Error),
 }
 
 impl DiscoveryError {
+    /// Returns whether retrying after network state changes may succeed.
     pub fn is_transient(&self) -> bool {
         match self {
             DiscoveryError::NoV6Connectivity | DiscoveryError::LinkLocalOnly(_) => true,
@@ -38,7 +46,7 @@ const DISCOVERY_PORT: u16 = 9;
 /// (RFC 6724) for the destination and `getsockname` reports the
 /// result.
 ///
-/// Single-shot. The caller owns retry policy, branching on
+/// This performs one attempt. The caller owns retry policy and branches on
 /// [`DiscoveryError::is_transient`].
 pub fn discover_local_v6(remote: Ipv6Addr) -> Result<Ipv6Addr, DiscoveryError> {
     let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).map_err(DiscoveryError::Socket)?;

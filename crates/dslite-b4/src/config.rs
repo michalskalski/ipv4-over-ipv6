@@ -1,3 +1,5 @@
+//! TOML configuration types, defaults, and safe diagnostics.
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::PathBuf;
@@ -9,37 +11,53 @@ use crate::tunnel::EncapsulationLimit;
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+/// Complete daemon configuration.
 pub struct Config {
+    /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Runtime state configuration.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Tunnel interface configuration.
     pub tunnel: TunnelConfig,
+    /// Static AFTR configuration.
     pub aftr: AftrConfig,
+    /// Automatic AFTR discovery configuration.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    /// Reconciliation timing configuration.
     pub health: HealthConfig,
 }
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
+/// Logging configuration.
 pub struct LoggingConfig {
     #[serde(default)]
+    /// Minimum emitted log level.
     pub level: LogLevel,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+/// Supported logging levels.
 pub enum LogLevel {
+    /// Error records only.
     Error,
+    /// Warning and error records.
     Warn,
     #[default]
+    /// Informational records and above.
     Info,
+    /// Debug records and above.
     Debug,
+    /// All trace records.
     Trace,
 }
 
 impl LogLevel {
+    /// Returns the lowercase name accepted by tracing filters.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Error => "error",
@@ -53,20 +71,26 @@ impl LogLevel {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+/// Desired tunnel interface configuration.
 pub struct TunnelConfig {
     #[serde(
         default = "default_tunnel_name",
         deserialize_with = "deserialize_tunnel_name"
     )]
+    /// Platform interface name.
     pub name: String,
+    /// Explicit local IPv6 endpoint, or automatic selection from the route.
     pub local_v6: Option<Ipv6Addr>,
     #[serde(
         default = "default_tunnel_local_v4",
         deserialize_with = "deserialize_b4_v4"
     )]
+    /// Reserved B4 IPv4 host address from `192.0.0.0/29`.
     pub local_v4: Ipv4Addr,
+    /// Optional interface MTU.
     pub mtu: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_encapsulation_limit")]
+    /// Optional IPv6 encapsulation limit policy.
     pub encapsulation_limit: Option<EncapsulationLimit>,
 }
 
@@ -180,8 +204,11 @@ where
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(from = "String")]
+/// Configured AFTR endpoint before DNS resolution.
 pub enum AftrAddress {
+    /// Literal IPv6 address.
     Ip(Ipv6Addr),
+    /// DNS name resolving to one or more IPv6 addresses.
     Fqdn(String),
 }
 
@@ -197,28 +224,38 @@ impl From<String> for AftrAddress {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+/// Static AFTR configuration.
 pub struct AftrConfig {
+    /// Static AFTR override, if configured.
     pub address: Option<AftrAddress>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "lowercase")]
+/// Automatic AFTR discovery mechanism.
 pub enum DiscoveryMethod {
     #[default]
+    /// Disable automatic discovery.
     None,
+    /// Use the HTTP Based IPv4 over IPv6 Provisioning Protocol.
     Hb46pp,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+/// Automatic AFTR discovery configuration.
 pub struct DiscoveryConfig {
     #[serde(default)]
+    /// Selected discovery mechanism.
     pub method: DiscoveryMethod,
     #[serde(default = "default_discovery_vendorid")]
+    /// Broadband Forum vendor identifier with six hexadecimal digits.
     pub vendor_id: String,
     #[serde(default = "default_discovery_product")]
+    /// Product identifier sent in HB46PP requests.
     pub product: String,
     #[serde(default)]
+    /// Whether HB46PP may use `t=a` provisioning endpoints.
     pub allow_unauthenticated: bool,
 }
 
@@ -235,17 +272,22 @@ impl Default for DiscoveryConfig {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+/// Periodic reconciliation and failover timing.
 pub struct HealthConfig {
     #[serde(default = "default_health_interval")]
+    /// Maximum seconds between reconciliation passes.
     pub interval_secs: NonZeroU64,
     #[serde(default = "default_aftr_missing_grace_secs")]
+    /// Seconds to retain a current AFTR missing from DNS answers.
     pub aftr_missing_grace_secs: u64,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+/// Runtime file location configuration.
 pub struct RuntimeConfig {
     #[serde(default = "default_runtime_state_dir")]
+    /// Directory containing the PID file, AFTR override, and status snapshot.
     pub state_dir: PathBuf,
 }
 
@@ -261,8 +303,15 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigParseError {
     #[error("invalid configuration at line {line}, column {column}")]
-    Located { line: usize, column: usize },
+    /// The parser identified a line and column without exposing source values.
+    Located {
+        /// Source line counted from one.
+        line: usize,
+        /// Source column counted from one.
+        column: usize,
+    },
     #[error("invalid configuration")]
+    /// The parser could not associate the diagnostic with a source location.
     Unlocated,
 }
 

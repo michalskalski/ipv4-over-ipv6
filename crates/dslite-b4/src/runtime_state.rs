@@ -1,3 +1,5 @@
+//! Locked PID file and AFTR runtime state provided by the operator.
+
 use anyhow::Context;
 use std::{
     fs::{File, OpenOptions, TryLockError},
@@ -12,6 +14,7 @@ use crate::config::AftrAddress;
 const PROVIDED_AFTR_FILENAME: &str = "aftr";
 const PID_FILENAME: &str = "dslite-b4.pid";
 
+/// Owns the daemon PID file and its exclusive process lock.
 pub struct PidFile {
     path: PathBuf,
     lock: File,
@@ -20,6 +23,9 @@ pub struct PidFile {
 }
 
 impl PidFile {
+    /// Creates and exclusively locks the PID file in `runtime_dir`.
+    ///
+    /// The file remains empty until [`Self::mark_ready`] is called.
     pub fn create(runtime_dir: &Path) -> anyhow::Result<Self> {
         ensure_runtime_dir(runtime_dir)?;
         let path = runtime_dir.join(PID_FILENAME);
@@ -79,6 +85,7 @@ impl Drop for PidFile {
     }
 }
 
+/// Reads the AFTR endpoint provided by the operator, if present.
 pub fn read_provided_aftr(runtime_dir: &Path) -> anyhow::Result<Option<AftrAddress>> {
     let path = runtime_dir.join(PROVIDED_AFTR_FILENAME);
 
@@ -95,6 +102,7 @@ pub fn read_provided_aftr(runtime_dir: &Path) -> anyhow::Result<Option<AftrAddre
     }
 }
 
+/// Atomically writes an AFTR endpoint provided by the operator.
 pub fn write_provided_aftr(runtime_dir: &Path, addr: &str) -> anyhow::Result<()> {
     let addr = addr.trim();
     anyhow::ensure!(!addr.is_empty(), "AFTR address must not be empty");
@@ -109,6 +117,7 @@ pub fn write_provided_aftr(runtime_dir: &Path, addr: &str) -> anyhow::Result<()>
     atomic_replace(&path, None, contents.as_bytes())
 }
 
+/// Removes the AFTR endpoint provided by the operator if it exists.
 pub fn clear_provided_aftr(runtime_dir: &Path) -> anyhow::Result<()> {
     let path = runtime_dir.join(PROVIDED_AFTR_FILENAME);
 
@@ -119,6 +128,7 @@ pub fn clear_provided_aftr(runtime_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Sends `SIGUSR1` to the daemon identified by the locked PID file.
 pub fn signal_daemon_refresh(runtime_dir: &Path) -> anyhow::Result<()> {
     let path = runtime_dir.join(PID_FILENAME);
     let pid = match std::fs::read_to_string(&path) {

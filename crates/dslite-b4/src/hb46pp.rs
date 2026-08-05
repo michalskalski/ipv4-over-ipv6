@@ -1,3 +1,5 @@
+//! Conversion between daemon discovery configuration and HB46PP models.
+
 use hb46pp::{
     Capability, FirmwareVersionError, ProductError, ProvisioningData, ProvisioningRequest,
     ProvisioningRequestError, VendorIdError,
@@ -7,17 +9,23 @@ use thiserror::Error;
 use crate::config::{AftrAddress, DiscoveryConfig};
 
 #[derive(Debug, Error)]
+/// Errors constructing an HB46PP provisioning request.
 pub enum RequestError {
     #[error(transparent)]
+    /// The configured vendor identifier is invalid.
     VendorId(#[from] VendorIdError),
     #[error(transparent)]
+    /// The configured product identifier is invalid.
     Product(#[from] ProductError),
     #[error(transparent)]
+    /// The daemon version cannot be represented on the wire.
     FirmwareVersion(#[from] FirmwareVersionError),
     #[error(transparent)]
+    /// The complete request violates an HB46PP constraint.
     Request(#[from] ProvisioningRequestError),
 }
 
+/// Constructs a DS Lite provisioning request from daemon configuration.
 pub fn provisioning_request(config: &DiscoveryConfig) -> Result<ProvisioningRequest, RequestError> {
     let vendor_id = config.vendor_id.parse()?;
     let product = config.product.parse()?;
@@ -35,13 +43,17 @@ pub fn provisioning_request(config: &DiscoveryConfig) -> Result<ProvisioningRequ
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Errors extracting a DS Lite offer from provisioning data.
 pub enum DsliteOfferError {
-    #[error("DS-Lite provisioning offer is missing the aftr field")]
+    #[error("DS Lite provisioning offer is missing the aftr field")]
+    /// The selected DS Lite offer has no `aftr` member.
     MissingAftr,
-    #[error("DS-Lite provisioning offer field aftr must be a string")]
+    #[error("DS Lite provisioning offer field aftr must be a string")]
+    /// The selected offer's `aftr` member is not a string.
     InvalidAftr,
 }
 
+/// Extracts the AFTR endpoint from the selected DS Lite offer, if present.
 pub fn dslite_aftr(data: &ProvisioningData) -> Result<Option<AftrAddress>, DsliteOfferError> {
     let Some(offer) = data.select(&[Capability::DsLite]) else {
         return Ok(None);
@@ -67,7 +79,7 @@ mod tests {
 
         assert_eq!(request.vendor_id().as_str(), "000000");
         assert_eq!(request.product().as_str(), "dslite-b4");
-        assert_eq!(request.version().as_str(), "0_1_0");
+        assert_eq!(request.version().as_str(), "0_1_1");
         assert_eq!(request.capabilities(), &[Capability::DsLite]);
         assert!(request.token().is_none());
         assert!(request.credentials().is_none());

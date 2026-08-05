@@ -1,4 +1,4 @@
-//! Versioned, file-backed operational status shared by supported platforms.
+//! Versioned operational status stored in a file on each supported platform.
 
 use std::{
     net::Ipv6Addr,
@@ -11,68 +11,105 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::atomic_file::atomic_replace;
 
+/// Current JSON status schema version.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Filename used for the status snapshot inside the runtime directory.
 pub const STATUS_FILENAME: &str = "status.json";
 
+/// Versioned snapshot of the daemon's last reconciliation result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusSnapshot {
     #[serde(deserialize_with = "deserialize_schema_version")]
+    /// Status schema version.
     pub schema_version: u32,
+    /// Time at which the snapshot was generated.
     pub generated_at: jiff::Timestamp,
+    /// Daemon process identifier.
     pub pid: u32,
+    /// Daemon package version.
     pub version: String,
+    /// Managed tunnel interface name.
     pub tunnel_name: String,
+    /// Availability of desired tunnel state.
     pub desired: StatusDesired,
+    /// Source that supplied the current AFTR.
     pub aftr_source: AftrSource,
     #[serde(deserialize_with = "deserialize_required_option")]
+    /// Configured or discovered AFTR name or literal.
     pub aftr: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    /// Selected local IPv6 tunnel endpoint.
     pub local_ipv6: Option<Ipv6Addr>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    /// Resolved remote IPv6 tunnel endpoint.
     pub remote_ipv6: Option<Ipv6Addr>,
+    /// Action taken by the last reconciliation pass.
     pub last_action: StatusAction,
+    /// Scheduled time of the next reconciliation pass.
     pub next_reconcile_at: jiff::Timestamp,
+    /// Constraint that selected the next reconciliation time.
     pub next_reconcile_reason: ReconcileReason,
 }
 
+/// Whether complete desired tunnel state was available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusDesired {
+    /// Complete tunnel state was resolved.
     Resolved,
+    /// Configuration requests no tunnel.
     Absent,
+    /// Desired state could not be resolved temporarily.
     Unavailable,
 }
 
+/// Source of the AFTR used to compute desired state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AftrSource {
+    /// Static configuration.
     Config,
+    /// Runtime override provided by the operator.
     Provided,
+    /// HB46PP automatic discovery.
     Hb46pp,
+    /// No AFTR source is active.
     None,
 }
 
+/// Reconciliation action reported in a status snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusAction {
+    /// A tunnel was created.
     Create,
+    /// Mutable tunnel properties were updated.
     Update,
+    /// A tunnel was replaced.
     Rebuild,
+    /// A tunnel was removed.
     Teardown,
+    /// Existing state was retained because desired state was unavailable.
     Keep,
+    /// No change was required.
     Noop,
 }
 
+/// Reason that determines the next reconciliation deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReconcileReason {
+    /// Periodic health interval.
     Health,
+    /// Discovery refresh directed by the protocol.
     Discovery,
+    /// Retry backoff after a transient failure.
     Retry,
 }
 
 impl StatusSnapshot {
+    /// Reads and validates a snapshot from `state_dir`.
     pub fn read(state_dir: &Path) -> anyhow::Result<Self> {
         let path = state_dir.join(STATUS_FILENAME);
         let bytes = std::fs::read(&path)
@@ -81,6 +118,7 @@ impl StatusSnapshot {
             .with_context(|| format!("parsing status snapshot {}", path.display()))
     }
 
+    /// Atomically writes the snapshot with mode `0644`.
     pub fn write_atomic(&self, state_dir: &Path) -> anyhow::Result<()> {
         let path = state_dir.join(STATUS_FILENAME);
         let mut contents =
@@ -89,10 +127,12 @@ impl StatusSnapshot {
         atomic_replace(&path, Some(0o644), &contents)
     }
 
+    /// Serializes the snapshot as indented JSON.
     pub fn pretty_json(&self) -> anyhow::Result<String> {
         serde_json::to_string_pretty(self).context("serializing status snapshot")
     }
 
+    /// Formats the snapshot for interactive status output relative to `now`.
     pub fn human(&self, now: SystemTime) -> String {
         let generated: SystemTime = self.generated_at.into();
         let next: SystemTime = self.next_reconcile_at.into();
@@ -128,6 +168,7 @@ impl StatusSnapshot {
         )
     }
 
+    /// Formats the concise status sent to the service manager.
     pub fn supervisor_summary(&self) -> String {
         format!(
             "desired={}, action={}, next={} at {}",
@@ -139,10 +180,12 @@ impl StatusSnapshot {
     }
 }
 
+/// Returns the current time as a status timestamp.
 pub fn timestamp_now() -> jiff::Timestamp {
     jiff::Timestamp::now()
 }
 
+/// Returns a status timestamp `duration` after the current time.
 pub fn timestamp_after(duration: Duration) -> anyhow::Result<jiff::Timestamp> {
     let value = SystemTime::now()
         .checked_add(duration)
@@ -157,6 +200,7 @@ pub fn timestamp_after(duration: Duration) -> anyhow::Result<jiff::Timestamp> {
     Ok(timestamp)
 }
 
+/// Removes a stale snapshot, treating an absent file as success.
 pub fn remove(state_dir: &Path) -> anyhow::Result<()> {
     let path = state_dir.join(STATUS_FILENAME);
     match std::fs::remove_file(&path) {
@@ -168,6 +212,7 @@ pub fn remove(state_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Returns the platform default runtime state directory.
 pub fn default_state_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     return PathBuf::from("/run/dslite-b4");

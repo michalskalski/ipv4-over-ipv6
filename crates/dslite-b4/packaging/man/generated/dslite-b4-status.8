@@ -1,0 +1,22 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH dslite-b4-status 8  "status "
+.SH NAME
+dslite\-b4\-status \- Show the last status snapshot written by the daemon
+.SH SYNOPSIS
+\fBdslite\-b4 status\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-\-json\fR] [\fB\-\-state\-dir\fR] [\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+Show the last status snapshot written by the daemon
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR [default: /etc/dslite\-b4.toml]
+Read configuration from this path
+.TP
+\fB\-\-json\fR
+Print the complete status snapshot as JSON
+.TP
+\fB\-\-state\-dir\fR \fI<PATH>\fR
+Read status from this runtime state directory
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

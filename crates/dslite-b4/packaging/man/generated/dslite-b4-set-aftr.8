@@ -1,0 +1,19 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH dslite-b4-set-aftr 8  "set-aftr "
+.SH NAME
+dslite\-b4\-set\-aftr \- Set the runtime AFTR override and ask the daemon to reconcile
+.SH SYNOPSIS
+\fBdslite\-b4 set\-aftr\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIADDRESS\fR>
+.SH DESCRIPTION
+Set the runtime AFTR override and ask the daemon to reconcile
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR [default: /etc/dslite\-b4.toml]
+Read configuration from this path
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIADDRESS\fR>
+AFTR IPv6 address or DNS name

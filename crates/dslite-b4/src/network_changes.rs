@@ -36,6 +36,7 @@ use crate::tunnel::illumos::{
 const NETWORK_EVENT_BATCH_WINDOW: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "linux")]
+/// Stream of relevant Linux netlink network-change hints.
 pub struct NetworkChanges {
     messages: futures_channel::mpsc::UnboundedReceiver<(
         NetlinkMessage<RouteNetlinkMessage>,
@@ -46,6 +47,7 @@ pub struct NetworkChanges {
 
 #[cfg(target_os = "linux")]
 impl NetworkChanges {
+    /// Subscribes to link, IPv6 address, route, and rule changes.
     pub fn new() -> anyhow::Result<Self> {
         let (connection, _, messages) = new_multicast_connection(&[
             MulticastGroup::Link,
@@ -57,6 +59,7 @@ impl NetworkChanges {
         Ok(Self { messages, task })
     }
 
+    /// Waits for one change and coalesces nearby notifications into a batch.
     pub async fn next_batch(&mut self) -> anyhow::Result<()> {
         let Some((message, _)) = self.messages.next().await else {
             return Err(anyhow::anyhow!("network change event stream ended"));
@@ -99,12 +102,14 @@ impl Drop for NetworkChanges {
 }
 
 #[cfg(target_os = "illumos")]
+/// Stream of relevant illumos routing-socket network-change hints.
 pub struct NetworkChanges {
     socket: AsyncFd<OwnedFd>,
 }
 
 #[cfg(target_os = "illumos")]
 impl NetworkChanges {
+    /// Opens a nonblocking PF_ROUTE socket.
     pub fn new() -> anyhow::Result<Self> {
         // SAFETY: FFI call with no outstanding preconditions.
         let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
@@ -128,6 +133,7 @@ impl NetworkChanges {
         })
     }
 
+    /// Waits for one change and coalesces nearby notifications into a batch.
     pub async fn next_batch(&mut self) -> anyhow::Result<()> {
         self.read_next_wake_hint().await?;
         let batch_deadline = tokio::time::Instant::now() + NETWORK_EVENT_BATCH_WINDOW;

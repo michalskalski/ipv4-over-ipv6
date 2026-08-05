@@ -1,3 +1,6 @@
+#![deny(missing_docs)]
+#![doc = include_str!("../README.md")]
+
 pub mod aftr;
 pub mod aftr_discovery;
 pub(crate) mod atomic_file;

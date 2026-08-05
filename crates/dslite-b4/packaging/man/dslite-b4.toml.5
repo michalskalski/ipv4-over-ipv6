@@ -1,0 +1,118 @@
+.TH DSLITE-B4.TOML 5 "August 2026" "dslite-b4 0.1.1" "File Formats Manual"
+.SH NAME
+dslite-b4.toml \- configuration for the dslite-b4 daemon
+.SH SYNOPSIS
+.B /etc/dslite-b4.toml
+.SH DESCRIPTION
+The file uses TOML syntax.
+Unknown fields are rejected.
+The daemon should be run only after
+.B dslite-b4 check-config
+accepts the file.
+.SH LOGGING
+.TP
+.B logging.level
+Minimum log level.
+Accepted values are
+.BR error ,
+.BR warn ,
+.BR info ,
+.BR debug ,
+and
+.BR trace .
+The default is
+.BR info .
+The
+.B RUST_LOG
+environment variable takes precedence.
+.SH RUNTIME STATE
+.TP
+.B runtime.state_dir
+Directory for the locked PID file, runtime AFTR override, and status snapshot.
+The default is
+.B /run/dslite-b4
+on Linux and
+.B /var/run/dslite-b4
+on illumos.
+.SH TUNNEL
+.TP
+.B tunnel.name
+Name of the managed tunnel interface.
+The default is
+.BR dslite0 .
+Platform interface naming rules apply.
+.TP
+.B tunnel.local_v6
+Local IPv6 tunnel endpoint.
+When omitted, the kernel selects the source address for the route to the AFTR.
+.TP
+.B tunnel.local_v4
+Local B4 IPv4 address.
+The value must be a host address from 192.0.0.2 through 192.0.0.6 as reserved by RFC 6333.
+The default is 192.0.0.2.
+.TP
+.B tunnel.mtu
+Optional interface MTU.
+When omitted, the operating system tunnel default is used.
+.TP
+.B tunnel.encapsulation_limit
+Optional IPv6 encapsulation limit from 1 through 255.
+The value
+.B disabled
+turns limit insertion off.
+When omitted, the operating system tunnel default is used.
+.SH AFTR
+.TP
+.B aftr.address
+Optional static AFTR IPv6 address or DNS name.
+A static value takes precedence over a runtime value and automatic discovery.
+.SH DISCOVERY
+.TP
+.B discovery.method
+Automatic discovery method.
+Accepted values are
+.B none
+and
+.BR hb46pp .
+The default is
+.BR none .
+.TP
+.B discovery.vendor_id
+Six digit hexadecimal Broadband Forum vendor identifier sent by HB46PP.
+The default is 000000.
+.TP
+.B discovery.product
+Product identifier sent by HB46PP.
+The default is
+.BR dslite-b4 .
+.TP
+.B discovery.allow_unauthenticated
+Allow HB46PP policy
+.BR t=a ,
+which permits HTTP or HTTPS without certificate validation.
+The default is false.
+Enable this only when required by the provider.
+.SH HEALTH
+.TP
+.B health.interval_secs
+Maximum number of seconds between reconciliation passes.
+Network changes and runtime state changes can wake the daemon sooner.
+The default is 30.
+.TP
+.B health.aftr_missing_grace_secs
+Time to retain the current AFTR after it disappears from DNS results.
+The default is 600 seconds.
+.SH FILES
+.TP
+.B /etc/dslite-b4.toml
+Default configuration path.
+.TP
+.B /run/dslite-b4
+Default Linux runtime state directory.
+.TP
+.B /var/run/dslite-b4
+Default illumos runtime state directory.
+.SH SEE ALSO
+.BR dslite-b4 (8),
+.BR systemd.service (5),
+.BR smf (7)

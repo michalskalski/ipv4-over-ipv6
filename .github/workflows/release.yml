@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Namespaced tag to release, such as hb46pp-v0.1.3
+        required: true
+        type: string
+      dry_run:
+        description: Validate and leave the GitHub release as a draft
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  validate:
+    name: Validate ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.release.outputs.package }}
+      version: ${{ steps.release.outputs.version }}
+      previous_tag: ${{ steps.release.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TAG }}
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+      - id: release
+        name: Validate tag and package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG" =~ ^(hb46pp|dslite-b4)-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          then
+            package="${BASH_REMATCH[1]}"
+            version="${BASH_REMATCH[2]}"
+          else
+            echo "Tag must match hb46pp-vX.Y.Z or dslite-b4-vX.Y.Z" >&2
+            exit 1
+          fi
+
+          git show-ref --verify --quiet "refs/tags/$TAG"
+          git fetch origin main
+          git merge-base --is-ancestor "$TAG^{commit}" origin/main
+
+          manifest_version=$(cargo metadata --format-version=1 --no-deps |
+            jq -r --arg package "$package" '.packages[] | select(.name == $package) | .version')
+          if [[ "$manifest_version" != "$version" ]]
+          then
+            echo "Tag version $version does not match $package $manifest_version" >&2
+            exit 1
+          fi
+
+          previous_tag=""
+          while IFS= read -r candidate
+          do
+            if [[ "$candidate" != "$TAG" ]]
+            then
+              previous_tag="$candidate"
+              break
+            fi
+          done < <(git tag --list "${package}-v*" --sort=-v:refname)
+
+          cargo package -p "$package" --locked
+
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+
+  github-release:
+    name: GitHub release
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TAG }}
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ needs.validate.outputs.previous_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            --method POST
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes"
+            -f "tag_name=$TAG"
+            -f "target_commitish=$TAG"
+          )
+          if [[ -n "$PREVIOUS_TAG" ]]
+          then
+            args+=(-f "previous_tag_name=$PREVIOUS_TAG")
+          fi
+          gh api "${args[@]}" > release-notes.json
+          jq -r .body release-notes.json > release-notes.md
+      - name: Create or refresh draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" > /dev/null 2>&1
+          then
+            is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+            if [[ "$is_draft" != true ]]
+            then
+              echo "Release $TAG is already published" >&2
+              exit 1
+            fi
+            gh release edit "$TAG" --draft --title "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file release-notes.md
+          fi
+      - name: Publish release
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false

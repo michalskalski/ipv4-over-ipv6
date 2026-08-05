@@ -1,19 +1,25 @@
+//! Selection policy for resolved AFTR endpoints.
+
 use std::{
     net::Ipv6Addr,
     time::{Duration, Instant},
 };
 
+/// Retains the current AFTR while applying DNS failover grace periods.
 pub struct AftrSelector {
     missing_since: Option<Instant>,
 }
 
 impl AftrSelector {
+    /// Creates a selector without a retained observation of a missing endpoint.
     pub fn new() -> Self {
         Self {
             missing_since: None,
         }
     }
 
+    /// Selects an AFTR candidate, retaining a missing current endpoint until
+    /// `missing_grace` has elapsed.
     pub fn select(
         &mut self,
         candidates: &[Ipv6Addr],
