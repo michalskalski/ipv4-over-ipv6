@@ -86,24 +86,40 @@ jobs:
           ref: ${{ env.TAG }}
       - name: Generate release notes
         env:
-          GH_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ needs.validate.outputs.package }}
           PREVIOUS_TAG: ${{ needs.validate.outputs.previous_tag }}
         shell: bash
         run: |
           set -euo pipefail
 
-          args=(
-            --method POST
-            "repos/$GITHUB_REPOSITORY/releases/generate-notes"
-            -f "tag_name=$TAG"
-            -f "target_commitish=$TAG"
-          )
           if [[ -n "$PREVIOUS_TAG" ]]
           then
-            args+=(-f "previous_tag_name=$PREVIOUS_TAG")
+            range="$PREVIOUS_TAG..$TAG"
+          else
+            range="$TAG"
           fi
-          gh api "${args[@]}" > release-notes.json
-          jq -r .body release-notes.json > release-notes.md
+
+          git log \
+            --format="- %s ([%h](https://github.com/$GITHUB_REPOSITORY/commit/%H))" \
+            "$range" \
+            -- "crates/$PACKAGE" > release-commits.md
+
+          if [[ ! -s release-commits.md ]]
+          then
+            echo "No commits for crates/$PACKAGE in $range" >&2
+            exit 1
+          fi
+
+          {
+            echo "## Changes"
+            echo
+            cat release-commits.md
+            if [[ -n "$PREVIOUS_TAG" ]]
+            then
+              echo
+              echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$PREVIOUS_TAG...$TAG"
+            fi
+          } > release-notes.md
       - name: Create or refresh draft
         env:
           GH_TOKEN: ${{ github.token }}
