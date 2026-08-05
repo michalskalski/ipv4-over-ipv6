@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use reqwest::header;
 
@@ -36,6 +39,11 @@ pub enum DefaultTransportError {
     /// The provisioning endpoint specified a literal IPv4 address.
     #[error("provisioning endpoint cannot use an IPv4 address")]
     Ipv4EndpointNotAllowed,
+
+    /// The provisioning endpoint specified an IPv6 address that is not a
+    /// usable unicast destination for a remote provisioning server.
+    #[error("provisioning endpoint cannot use the IPv6 address {0}")]
+    Ipv6EndpointNotAllowed(Ipv6Addr),
 }
 
 /// Default HTTP transport for HB46PP provisioning requests.
@@ -71,42 +79,57 @@ impl Transport for DefaultTransport {
     type Error = DefaultTransportError;
 
     async fn send_once(&self, request: TransportRequest) -> Result<TransportResponse, Self::Error> {
-        if matches!(request.endpoint().host(), Some(url::Host::Ipv4(_))) {
-            return Err(DefaultTransportError::Ipv4EndpointNotAllowed);
-        }
+        validate_literal_endpoint(request.endpoint())?;
 
         let client = match request.tls_policy() {
             TlsPolicy::ValidateCertificate => &self.validated_client,
             TlsPolicy::NoCertificateValidation => &self.unvalidated_client,
         };
 
-        let mut response = client.get(request.endpoint().clone()).send().await?;
+        send_request(client, request.endpoint().clone()).await
+    }
+}
 
-        let status = response.status().as_u16();
-        let location = extract_single_header_value(response.headers(), &header::LOCATION)?;
-        let cache_control =
-            extract_comma_list_header_value(response.headers(), &header::CACHE_CONTROL)?;
+async fn send_request(
+    client: &reqwest::Client,
+    endpoint: url::Url,
+) -> Result<TransportResponse, DefaultTransportError> {
+    let mut response = client.get(endpoint).send().await?;
 
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_ACCEPTED_RESPONSE_BODY_SIZE as u64)
-        {
-            return Err(DefaultTransportError::ResponseBodyTooLarge {
-                limit: MAX_ACCEPTED_RESPONSE_BODY_SIZE,
-            });
+    let status = response.status().as_u16();
+    let location = extract_single_header_value(response.headers(), &header::LOCATION)?;
+    let cache_control =
+        extract_comma_list_header_value(response.headers(), &header::CACHE_CONTROL)?;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ACCEPTED_RESPONSE_BODY_SIZE as u64)
+    {
+        return Err(DefaultTransportError::ResponseBodyTooLarge {
+            limit: MAX_ACCEPTED_RESPONSE_BODY_SIZE,
+        });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        append_response_body_chunk(&mut body, &chunk)?;
+    }
+
+    Ok(TransportResponse::new(
+        status,
+        location,
+        cache_control,
+        body,
+    ))
+}
+
+fn validate_literal_endpoint(endpoint: &url::Url) -> Result<(), DefaultTransportError> {
+    match endpoint.host() {
+        Some(url::Host::Ipv4(_)) => Err(DefaultTransportError::Ipv4EndpointNotAllowed),
+        Some(url::Host::Ipv6(address)) if !is_allowed_ipv6_address(address) => {
+            Err(DefaultTransportError::Ipv6EndpointNotAllowed(address))
         }
-
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            append_response_body_chunk(&mut body, &chunk)?;
-        }
-
-        Ok(TransportResponse::new(
-            status,
-            location,
-            cache_control,
-            body,
-        ))
+        _ => Ok(()),
     }
 }
 
@@ -175,7 +198,24 @@ impl reqwest::dns::Resolve for Ipv6Resolver {
 }
 
 fn ipv6_addresses(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
-    addresses.into_iter().filter(SocketAddr::is_ipv6).collect()
+    addresses
+        .into_iter()
+        .filter(|address| match address {
+            SocketAddr::V6(address) => is_allowed_ipv6_address(*address.ip()),
+            SocketAddr::V4(_) => false,
+        })
+        .collect()
+}
+
+fn is_allowed_ipv6_address(address: Ipv6Addr) -> bool {
+    // Keep this list explicit. Unique-local addresses may be used in provider
+    // networks, while node-local and link-local destinations expose local
+    // services to server-side request forgery.
+    address.to_ipv4_mapped().is_none()
+        && !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && !address.is_unicast_link_local()
 }
 
 fn build_http_client(
@@ -235,14 +275,65 @@ mod tests {
         (endpoint, server)
     }
 
+    async fn send_to_test_server(
+        transport: &DefaultTransport,
+        request: &TransportRequest,
+    ) -> Result<TransportResponse, DefaultTransportError> {
+        let client = match request.tls_policy() {
+            TlsPolicy::ValidateCertificate => &transport.validated_client,
+            TlsPolicy::NoCertificateValidation => &transport.unvalidated_client,
+        };
+
+        send_request(client, request.endpoint().clone()).await
+    }
+
     #[test]
-    fn ipv6_addresses_removes_ipv4_addresses() {
-        let ipv4 = "192.0.2.1:443".parse().unwrap();
-        let ipv6 = "[2001:db8::1]:443".parse().unwrap();
+    fn ipv6_addresses_removes_disallowed_destinations() {
+        let addresses = [
+            "192.0.2.1:443",
+            "[::ffff:192.0.2.1]:443",
+            "[::]:443",
+            "[::1]:443",
+            "[ff02::1]:443",
+            "[fe80::1]:443",
+            "[2001:db8::1]:443",
+            "[fd00::1]:443",
+            "[64:ff9b::c000:201]:443",
+        ]
+        .map(|address| address.parse().unwrap());
 
-        let result = ipv6_addresses([ipv4, ipv6]);
+        let result = ipv6_addresses(addresses);
 
-        assert_eq!(result, [ipv6]);
+        assert_eq!(
+            result,
+            [
+                "[2001:db8::1]:443".parse().unwrap(),
+                "[fd00::1]:443".parse().unwrap(),
+                "[64:ff9b::c000:201]:443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_endpoint_validation_rejects_disallowed_ipv6_addresses() {
+        for address in ["::ffff:192.0.2.1", "::", "::1", "ff02::1", "fe80::1"] {
+            let endpoint = url::Url::parse(&format!("https://[{address}]/provision")).unwrap();
+
+            let result = validate_literal_endpoint(&endpoint);
+
+            assert!(result.is_err(), "address {address} was accepted");
+        }
+    }
+
+    #[test]
+    fn literal_endpoint_validation_allows_routed_unicast_scopes() {
+        for address in ["2001:db8::1", "fd00::1"] {
+            let endpoint = url::Url::parse(&format!("https://[{address}]/provision")).unwrap();
+
+            let result = validate_literal_endpoint(&endpoint);
+
+            assert!(result.is_ok(), "address {address}: {result:?}");
+        }
     }
 
     #[test]
@@ -334,7 +425,7 @@ mod tests {
             DefaultTransport::new_with_request_timeout(Duration::from_millis(20)).unwrap();
         let request = TransportRequest::new(endpoint, TlsPolicy::NoCertificateValidation);
 
-        let result = transport.send_once(request).await;
+        let result = send_to_test_server(&transport, &request).await;
         server.abort();
 
         assert!(matches!(result, Err(DefaultTransportError::Request(error)) if error.is_timeout()));
@@ -374,7 +465,7 @@ mod tests {
         let transport = DefaultTransport::new().unwrap();
         let request = TransportRequest::new(endpoint, TlsPolicy::NoCertificateValidation);
 
-        let result = transport.send_once(request).await;
+        let result = send_to_test_server(&transport, &request).await;
         server.await.unwrap();
 
         let response = result.unwrap();
@@ -397,7 +488,7 @@ mod tests {
         let transport = DefaultTransport::new().unwrap();
         let request = TransportRequest::new(endpoint, TlsPolicy::NoCertificateValidation);
 
-        let result = transport.send_once(request).await;
+        let result = send_to_test_server(&transport, &request).await;
         server.await.unwrap();
 
         let response = result.unwrap();

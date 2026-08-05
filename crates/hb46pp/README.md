@@ -91,6 +91,10 @@ HTTPS without certificate validation. Applications that require compatibility
 with such a provider must explicitly select
 `ProvisioningAuthenticationPolicy::AllowUnauthenticated`.
 
+The default transport rejects IPv4 and IPv4-mapped endpoints as well as
+unspecified, loopback, multicast, and link-local IPv6 destinations. Unique-local
+addresses remain available for provider network compatibility.
+
 ## License
 
 Licensed under either of the following:
