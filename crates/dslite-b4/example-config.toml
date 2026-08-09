@@ -19,8 +19,10 @@ local_v4 = "192.0.0.2"
 # encapsulation_limit = 4
 
 [aftr]
-# Optional static override. If omitted, the daemon reads runtime AFTR state.
-address = "2001:db8::2"
+# Optional static AFTR IPv6 address. Uncomment this when the AFTR is known and
+# should not be supplied by an external client or discovered dynamically.
+# A static address takes precedence over runtime AFTR state and discovery.
+# address = "2001:db8::2"
 
 [discovery]
 # Optional. Defaults to "none". Use "hb46pp" to enable automatic discovery.

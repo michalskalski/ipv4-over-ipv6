@@ -58,6 +58,10 @@ An AFTR may be configured statically, supplied at runtime, or discovered using
 the optional HB46PP integration enabled by default. Static configuration takes
 precedence over the runtime value, which takes precedence over discovery.
 
+[RFC 6334][rfc-6334] DHCPv6 integration is external to the daemon. `dslite-b4` exposes
+`set-aftr` and `clear-aftr` for a DHCP client hook to update its runtime AFTR
+state. This approach has been tested only with ISC dhclient.
+
 HB46PP discovery accepts only provisioning servers using certificate validation
 (`t=b`) by default. Providers requiring `t=a` can be enabled explicitly with
 `discovery.allow_unauthenticated`, which permits HTTP or HTTPS without
@@ -82,3 +86,4 @@ Licensed under either of the following:
 
 [example-config]: https://github.com/michalskalski/ipv4-over-ipv6/blob/main/crates/dslite-b4/example-config.toml
 [rfc-6333]: https://www.rfc-editor.org/rfc/rfc6333
+[rfc-6334]: https://www.rfc-editor.org/rfc/rfc6334
