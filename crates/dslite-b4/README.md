@@ -28,6 +28,12 @@ configuration as `/etc/dslite-b4.toml`, and the manuals under
 The SMF manifest and method are intended for `/lib/svc/manifest/network` and
 `/lib/svc/method`.
 
+On OmniOS, build a native IPS archive with `crates/dslite-b4/packaging/ips/build.sh`.
+It writes `target/dslite-b4-<version>.p5p`. The package is disabled by default. Install
+it with `pfexec pkg install -g ./target/dslite-b4-<version>.p5p network/dslite-b4`,
+configure `/etc/dslite-b4.toml`, validate with `dslite-b4 check-config`, then
+enable it with `pfexec svcadm enable dslite-b4`.
+
 ## Configure and run
 
 The executable reads `/etc/dslite-b4.toml` by default. Another path can be

@@ -1,0 +1,11 @@
+<transform dir -> drop>
+<transform file path=etc/dslite-b4.toml -> set group root>
+<transform file path=etc/dslite-b4.toml -> set mode 0600>
+<transform file path=etc/dslite-b4.toml -> add preserve renamenew>
+<transform file path=etc/dslite-b4.toml -> add restart_fmri svc:/network/dslite-b4:default>
+<transform file path=usr/sbin/dslite-b4 -> add restart_fmri svc:/network/dslite-b4:default>
+<transform file path=lib/svc/method/dslite-b4 -> add restart_fmri svc:/network/dslite-b4:default>
+<transform file path=lib/svc/manifest/network/dslite-b4.xml -> add disable_fmri svc:/network/dslite-b4:default>
+<transform file path=lib/svc/manifest/network/dslite-b4.xml -> add restart_fmri svc:/system/manifest-import:default>
+<transform file path=usr/share/man/man[58]/.* -> add facet.doc.man true>
+<transform file path=usr/share/man/man[58]/.* -> add restart_fmri svc:/application/man-index:default>

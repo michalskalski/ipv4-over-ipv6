@@ -1,0 +1,4 @@
+set name=pkg.summary value="DS-Lite B4 tunnel management daemon"
+set name=pkg.description value="dslite-b4 manages the B4 function of an RFC 6333 DS-Lite tunnel on illumos."
+license LICENSE-APACHE license=Apache-2.0
+license LICENSE-MIT license=MIT
