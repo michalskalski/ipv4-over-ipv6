@@ -79,7 +79,10 @@ mod tests {
 
         assert_eq!(request.vendor_id().as_str(), "000000");
         assert_eq!(request.product().as_str(), "dslite-b4");
-        assert_eq!(request.version().as_str(), "0_1_1");
+        assert_eq!(
+            request.version().as_str(),
+            env!("CARGO_PKG_VERSION").replace('.', "_")
+        );
         assert_eq!(request.capabilities(), &[Capability::DsLite]);
         assert!(request.token().is_none());
         assert!(request.credentials().is_none());
