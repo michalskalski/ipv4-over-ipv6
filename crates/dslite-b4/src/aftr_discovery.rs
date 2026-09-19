@@ -168,8 +168,7 @@ impl Hb46ppRuntime {
             "HB46PP provisioning response received"
         );
 
-        let aftr = crate::hb46pp::dslite_aftr(response.data())
-            .context("invalid DS-Lite provisioning offer")?;
+        let aftr = crate::hb46pp::dslite_aftr(response.data());
 
         if let Some(token) = response.data().token().cloned() {
             self.request.set_token(Some(token));

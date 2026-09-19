@@ -1109,7 +1109,7 @@ mod tests {
         assert_eq!(data.provider_info().enabler_name(), "example");
         assert_eq!(data.order(), [Capability::DsLite]);
         assert_eq!(
-            data.offer(Capability::DsLite),
+            data.raw_offer(Capability::DsLite),
             Some(&serde_json::json!({"aftr": "dslite.example"}))
         );
         assert_eq!(response.cache_control(), Some("max-age=3600, NO-STORE"));
@@ -1242,7 +1242,7 @@ mod tests {
         assert_eq!(data.provider_info().enabler_name(), "example");
         assert_eq!(data.order(), [Capability::DsLite]);
         assert_eq!(
-            data.offer(Capability::DsLite),
+            data.raw_offer(Capability::DsLite),
             Some(&serde_json::json!({"aftr": "dslite.example"}))
         );
         assert!(response.may_persist());

@@ -5,5 +5,7 @@
 #[cfg(feature = "client")]
 pub mod client;
 mod model;
+mod offers;
 
 pub use model::*;
+pub use offers::*;

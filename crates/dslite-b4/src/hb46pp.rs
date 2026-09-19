@@ -2,7 +2,7 @@
 
 use hb46pp::{
     Capability, FirmwareVersionError, ProductError, ProvisioningData, ProvisioningRequest,
-    ProvisioningRequestError, VendorIdError,
+    ProvisioningRequestError, TunnelEndpoint, VendorIdError,
 };
 use thiserror::Error;
 
@@ -42,31 +42,14 @@ pub fn provisioning_request(config: &DiscoveryConfig) -> Result<ProvisioningRequ
     .map_err(RequestError::from)
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-/// Errors extracting a DS Lite offer from provisioning data.
-pub enum DsliteOfferError {
-    #[error("DS Lite provisioning offer is missing the aftr field")]
-    /// The selected DS Lite offer has no `aftr` member.
-    MissingAftr,
-    #[error("DS Lite provisioning offer field aftr must be a string")]
-    /// The selected offer's `aftr` member is not a string.
-    InvalidAftr,
-}
-
 /// Extracts the AFTR endpoint from the selected DS Lite offer, if present.
-pub fn dslite_aftr(data: &ProvisioningData) -> Result<Option<AftrAddress>, DsliteOfferError> {
-    let Some(offer) = data.select(&[Capability::DsLite]) else {
-        return Ok(None);
-    };
-
-    let Some(aftr) = offer.parameters().get("aftr") else {
-        return Err(DsliteOfferError::MissingAftr);
-    };
-    let Some(aftr) = aftr.as_str() else {
-        return Err(DsliteOfferError::InvalidAftr);
-    };
-
-    Ok(Some(aftr.to_string().into()))
+pub fn dslite_aftr(data: &ProvisioningData) -> Option<AftrAddress> {
+    data.select(&[Capability::DsLite])?;
+    let parameters = data.dslite()?;
+    Some(match parameters.aftr() {
+        TunnelEndpoint::Ipv6(address) => AftrAddress::Ip(*address),
+        TunnelEndpoint::DnsName(name) => AftrAddress::Fqdn(name.as_str().to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -99,7 +82,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = dslite_aftr(&data).unwrap();
+        let result = dslite_aftr(&data);
 
         assert!(matches!(
             result,
@@ -118,40 +101,34 @@ mod tests {
         )
         .unwrap();
 
-        let result = dslite_aftr(&data).unwrap();
+        let result = dslite_aftr(&data);
 
         assert!(result.is_none());
     }
 
     #[test]
-    fn rejects_dslite_offer_without_aftr() {
-        let data = ProvisioningData::parse(
+    fn malformed_dslite_offer_is_rejected_while_parsing() {
+        let result = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["dslite"],
                 "dslite": {}
             }"#,
-        )
-        .unwrap();
+        );
 
-        let result = dslite_aftr(&data);
-
-        assert!(matches!(result, Err(DsliteOfferError::MissingAftr)));
+        assert!(result.is_err());
     }
 
     #[test]
-    fn rejects_non_string_aftr() {
-        let data = ProvisioningData::parse(
+    fn non_string_aftr_is_rejected_while_parsing() {
+        let result = ProvisioningData::parse(
             r#"{
                 "enabler_name": "example",
                 "order": ["dslite"],
                 "dslite": {"aftr": 42}
             }"#,
-        )
-        .unwrap();
+        );
 
-        let result = dslite_aftr(&data);
-
-        assert!(matches!(result, Err(DsliteOfferError::InvalidAftr)));
+        assert!(result.is_err());
     }
 }

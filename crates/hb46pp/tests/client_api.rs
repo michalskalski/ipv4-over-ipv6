@@ -17,6 +17,9 @@ use hb46pp::client::{
 };
 #[cfg(feature = "default-client")]
 use hb46pp::client::{DefaultClient, DefaultClientBuilder, DefaultClientError};
+use hb46pp::{
+    Capability, MapEVersion, MapEVersionError, ProvisioningData, ProvisioningOffer, TunnelEndpoint,
+};
 
 struct FakeResolver;
 
@@ -119,4 +122,50 @@ fn downstream_crates_can_inspect_retry_actions() {
 
     let window = action.window();
     assert!(window.min() <= window.max());
+}
+
+#[test]
+fn downstream_crates_can_use_typed_and_raw_offers() {
+    let data = ProvisioningData::parse(
+        r#"{
+            "enabler_name":"example",
+            "order":["dslite"],
+            "dslite":{"aftr":"2001:db8::1","future_member":{"enabled":true}}
+        }"#,
+    )
+    .unwrap();
+
+    let selected = data.select(&[Capability::DsLite]).unwrap();
+    let ProvisioningOffer::DsLite(parameters) = selected else {
+        panic!("expected DS-Lite parameters");
+    };
+    assert_eq!(
+        parameters.aftr(),
+        &TunnelEndpoint::Ipv6("2001:db8::1".parse().unwrap())
+    );
+    assert_eq!(
+        data.raw_offer(Capability::DsLite).unwrap()["future_member"]["enabled"],
+        true
+    );
+    assert_eq!(
+        data.dslite().unwrap().aftr(),
+        &TunnelEndpoint::Ipv6("2001:db8::1".parse().unwrap())
+    );
+}
+
+#[test]
+fn downstream_crates_can_use_non_exhaustive_map_e_versions() {
+    fn name(version: MapEVersion) -> &'static str {
+        match version {
+            MapEVersion::Draft03 => "draft-03",
+            MapEVersion::Rfc7597 => "rfc-7597",
+            _ => "future",
+        }
+    }
+
+    assert_eq!(name(MapEVersion::Draft03), "draft-03");
+    assert_eq!(
+        "2".parse::<MapEVersion>(),
+        Err(MapEVersionError::UnsupportedValue("2".to_string()))
+    );
 }

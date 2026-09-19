@@ -6,8 +6,8 @@ provisioning parameters for IPv4-over-IPv6 methods. It implements bootstrap TXT
 discovery, request and response validation, IPv6-only HTTP transport, protocol
 redirects, and retry timing and migration-state guidance.
 
-Provisioning data for each supported IPv4-over-IPv6 method is retained as
-JSON. Applications select a method and interpret its parameters.
+Provisioning data is parsed into typed offers. Use `raw_offer()` to access
+unknown offer members.
 
 ## Example
 
@@ -19,7 +19,10 @@ but callers can customize them with `DefaultClient::builder`.
 ```rust
 # #[cfg(feature = "default-client")]
 # mod example {
-use hb46pp::{Capability, FirmwareVersion, Product, ProvisioningRequest, VendorId};
+use hb46pp::{
+    Capability, FirmwareVersion, Product, ProvisioningOffer, ProvisioningRequest,
+    TunnelEndpoint, VendorId,
+};
 use hb46pp::client::{DefaultClient, ProvisioningOutcome};
 
 async fn provision() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,8 +41,15 @@ async fn provision() -> Result<(), Box<dyn std::error::Error>> {
 
     match outcome {
         ProvisioningOutcome::Provisioned(response) => {
-            if let Some(offer) = response.data().select(&[Capability::DsLite]) {
-                println!("DS-Lite parameters: {}", offer.parameters());
+            if let Some(ProvisioningOffer::DsLite(offer)) = response.data().select(&[Capability::DsLite]) {
+                match offer.aftr() {
+                    TunnelEndpoint::Ipv6(address) => println!("AFTR IPv6 address: {address}"),
+                    TunnelEndpoint::DnsName(name) => println!("AFTR DNS name: {name}"),
+                }
+            }
+
+            if let Some(raw) = response.data().raw_offer(Capability::DsLite) {
+                println!("raw DS-Lite offer: {raw}");
             }
 
             if let Some(token) = response.data().token().cloned() {

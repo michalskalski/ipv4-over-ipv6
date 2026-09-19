@@ -5,6 +5,11 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use url::{Host, Url};
 
+use crate::{
+    DsLiteParameters, IpIpParameters, Lw4o6Parameters, MapEParameters, MapTParameters, OfferError,
+    ProvisioningOffer, Xlat464Parameters,
+};
+
 const V6MIG_SPEC: &str = "v6mig-1";
 const MAX_TTL_SECS: u64 = 604_800;
 
@@ -41,7 +46,7 @@ pub enum BootstrapError {
     Ipv4EndpointNotAllowed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// An IPv4-over-IPv6 method recognized by HB46PP.
 pub enum Capability {
     /// 464XLAT.
@@ -205,27 +210,6 @@ impl ProviderInfo {
     }
 }
 
-/// An offer supported by the caller and selected using the server's preference order.
-pub struct SelectedOffer<'a> {
-    capability: Capability,
-    parameters: &'a serde_json::Value,
-}
-
-impl SelectedOffer<'_> {
-    /// Returns the IPv4-over-IPv6 method selected for this offer.
-    pub fn capability(&self) -> Capability {
-        self.capability
-    }
-
-    /// Returns the method parameters without interpreting their contents.
-    ///
-    /// Parameters are a JSON object for every capability except `ipip`, whose
-    /// parameters are an array containing one JSON object for each tunnel.
-    pub fn parameters(&self) -> &serde_json::Value {
-        self.parameters
-    }
-}
-
 #[derive(Debug, Error)]
 #[non_exhaustive]
 /// Errors returned when parsing and validating [`ProvisioningData`].
@@ -269,17 +253,22 @@ pub enum ProvisioningDataError {
     /// The preference order names a capability without providing its parameters.
     #[error("response order lists a method without its provisioning payload: {0:?}")]
     MissingOffer(Capability),
-    /// A capability's parameters are not in the JSON shape required by HB46PP.
-    #[error("invalid provisioning payload shape for capability: {0:?}")]
-    InvalidOfferShape(Capability),
+    /// Invalid typed offer.
+    #[error("invalid provisioning offer for capability {capability:?}: {source}")]
+    Offer {
+        /// Offer capability.
+        capability: Capability,
+        /// Validation error.
+        #[source]
+        source: OfferError,
+    },
+    /// Missing 464XLAT offer for IPv6-Mostly.
+    #[error("ipv6_mostly=true requires a 464xlat offer")]
+    MissingIpv6MostlyOffer,
 }
 
 #[derive(Debug, Clone)]
-/// Validated provisioning data returned by an HB46PP server.
-///
-/// The type validates the shared response fields and retains each method's
-/// parameters as JSON for interpretation by the application implementing that
-/// method. Unknown fields in the outer object are ignored.
+/// Validated HB46PP provisioning response.
 pub struct ProvisioningData {
     provider_info: ProviderInfo,
     ttl: Option<Ttl>,
@@ -287,7 +276,13 @@ pub struct ProvisioningData {
     auth: Option<AuthStatus>,
     order: Vec<Capability>,
     ipv6_mostly: Option<bool>,
-    offers: BTreeMap<Capability, Value>,
+    offers: BTreeMap<Capability, OfferEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct OfferEntry {
+    typed: ProvisioningOffer,
+    raw: Value,
 }
 
 impl ProvisioningData {
@@ -334,27 +329,37 @@ impl ProvisioningData {
 
         let mut offers = BTreeMap::new();
         for capability in Capability::ALL {
-            let Some(parameters) = take_optional::<Value>(&mut fields, capability.as_str())? else {
+            let Some(parameters) = fields.remove(capability.as_str()) else {
                 continue;
             };
 
-            let has_valid_shape = match capability {
-                Capability::IpIp => parameters
-                    .as_array()
-                    .is_some_and(|tunnels| tunnels.iter().all(Value::is_object)),
-                _ => parameters.is_object(),
-            };
-
-            if !has_valid_shape {
-                return Err(ProvisioningDataError::InvalidOfferShape(capability));
+            if parameters.is_null() {
+                return Err(ProvisioningDataError::Offer {
+                    capability,
+                    source: OfferError::Invalid {
+                        path: capability.as_str().to_string(),
+                        message: "must not be null".to_string(),
+                    },
+                });
             }
 
-            offers.insert(capability, parameters);
+            let offer = ProvisioningOffer::parse(capability, &parameters)
+                .map_err(|source| ProvisioningDataError::Offer { capability, source })?;
+            offers.insert(
+                capability,
+                OfferEntry {
+                    typed: offer,
+                    raw: parameters,
+                },
+            );
         }
         for capability in &order {
             if !offers.contains_key(capability) {
                 return Err(ProvisioningDataError::MissingOffer(*capability));
             }
+        }
+        if ipv6_mostly == Some(true) && !offers.contains_key(&Capability::Xlat464) {
+            return Err(ProvisioningDataError::MissingIpv6MostlyOffer);
         }
 
         Ok(Self {
@@ -376,20 +381,17 @@ impl ProvisioningData {
     ///
     /// The order of `supported` does not affect selection. If none of the
     /// server's ordered offers are supported, this returns `None`.
-    pub fn select(&self, supported: &[Capability]) -> Option<SelectedOffer<'_>> {
+    pub fn select(&self, supported: &[Capability]) -> Option<&ProvisioningOffer> {
         for &capability in self.order() {
             if !supported.contains(&capability) {
                 continue;
             }
 
-            let Some(parameters) = self.offer(capability) else {
+            let Some(offer) = self.offer(capability) else {
                 continue;
             };
 
-            return Some(SelectedOffer {
-                capability,
-                parameters,
-            });
+            return Some(offer);
         }
 
         None
@@ -433,12 +435,46 @@ impl ProvisioningData {
         self.ipv6_mostly
     }
 
-    /// Returns the uninterpreted parameters offered for a capability.
+    /// Typed offer for a capability.
+    pub fn offer(&self, capability: Capability) -> Option<&ProvisioningOffer> {
+        self.offers.get(&capability).map(|entry| &entry.typed)
+    }
+
+    /// Raw JSON for a known offer.
     ///
-    /// An offer may be present even when the capability is not listed in the
-    /// server preference order, as required for IPv6-Mostly provisioning.
-    pub fn offer(&self, capability: Capability) -> Option<&Value> {
-        self.offers.get(&capability)
+    /// Preserves unknown members.
+    pub fn raw_offer(&self, capability: Capability) -> Option<&Value> {
+        self.offers.get(&capability).map(|entry| &entry.raw)
+    }
+
+    /// 464XLAT parameters, if supplied.
+    pub fn xlat464(&self) -> Option<&Xlat464Parameters> {
+        self.offer(Capability::Xlat464)?.as_xlat464()
+    }
+
+    /// DS-Lite parameters, if supplied.
+    pub fn dslite(&self) -> Option<&DsLiteParameters> {
+        self.offer(Capability::DsLite)?.as_dslite()
+    }
+
+    /// IP-in-IP parameters, if supplied.
+    pub fn ipip(&self) -> Option<&IpIpParameters> {
+        self.offer(Capability::IpIp)?.as_ipip()
+    }
+
+    /// Lightweight 4over6 parameters, if supplied.
+    pub fn lw4o6(&self) -> Option<&Lw4o6Parameters> {
+        self.offer(Capability::Lw4o6)?.as_lw4o6()
+    }
+
+    /// MAP-E parameters, if supplied.
+    pub fn map_e(&self) -> Option<&MapEParameters> {
+        self.offer(Capability::MapE)?.as_map_e()
+    }
+
+    /// MAP-T parameters, if supplied.
+    pub fn map_t(&self) -> Option<&MapTParameters> {
+        self.offer(Capability::MapT)?.as_map_t()
     }
 }
 
@@ -483,7 +519,11 @@ fn validate_informational_name(
     field: &'static str,
     value: &str,
 ) -> Result<(), ProvisioningDataError> {
-    if value.len() + 2 > 256 {
+    if serde_json::to_vec(value)
+        .expect("serializing a string cannot fail")
+        .len()
+        > 256
+    {
         return Err(ProvisioningDataError::InformationalNameTooLong(field));
     }
 
@@ -1186,7 +1226,7 @@ mod tests {
         assert_eq!(response.auth(), None);
         assert_eq!(response.order(), [Capability::DsLite]);
         assert_eq!(
-            response.offer(Capability::DsLite),
+            response.raw_offer(Capability::DsLite),
             Some(&serde_json::json!({"aftr": "dslite.v6connect.net"}))
         );
     }
@@ -1207,7 +1247,7 @@ mod tests {
         assert_eq!(response.order(), [Capability::DsLite]);
         assert_eq!(response.ipv6_mostly(), Some(true));
         assert_eq!(
-            response.offer(Capability::Xlat464),
+            response.raw_offer(Capability::Xlat464),
             Some(&serde_json::json!({"nat64prefix": "64:ff9b::/96"}))
         );
     }
@@ -1218,7 +1258,7 @@ mod tests {
             r#"{
                 "enabler_name": "example",
                 "order": ["map_e", "dslite"],
-                "map_e": {"br": "2001:db8::1", "rules": []},
+                "map_e": {"br": "2001:db8::1", "rules": [{"ipv6":"2001:db8::/56","ipv4":"192.0.2.0/24","ea_length":8,"psid_offset":0}]},
                 "dslite": {"aftr": "dslite.example"}
             }"#,
         )
@@ -1229,10 +1269,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(selected.capability(), Capability::MapE);
-        assert_eq!(
-            selected.parameters(),
-            &serde_json::json!({"br": "2001:db8::1", "rules": []})
-        );
+        assert!(selected.as_map_e().is_some());
     }
 
     #[test]
@@ -1241,7 +1278,7 @@ mod tests {
             r#"{
                 "enabler_name": "example",
                 "order": ["map_e", "dslite"],
-                "map_e": {"br": "2001:db8::1", "rules": []},
+                "map_e": {"br": "2001:db8::1", "rules": [{"ipv6":"2001:db8::/56","ipv4":"192.0.2.0/24","ea_length":8,"psid_offset":0}]},
                 "dslite": {"aftr": "dslite.example"}
             }"#,
         )
@@ -1250,10 +1287,7 @@ mod tests {
         let selected = response.select(&[Capability::DsLite]).unwrap();
 
         assert_eq!(selected.capability(), Capability::DsLite);
-        assert_eq!(
-            selected.parameters(),
-            &serde_json::json!({"aftr": "dslite.example"})
-        );
+        assert!(selected.as_dslite().is_some());
     }
 
     #[test]
@@ -1262,7 +1296,7 @@ mod tests {
             r#"{
                 "enabler_name": "example",
                 "order": ["map_e"],
-                "map_e": {"br": "2001:db8::1", "rules": []}
+                "map_e": {"br": "2001:db8::1", "rules": [{"ipv6":"2001:db8::/56","ipv4":"192.0.2.0/24","ea_length":8,"psid_offset":0}]}
             }"#,
         )
         .unwrap();
@@ -1297,7 +1331,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProvisioningDataError::InvalidOfferShape(Capability::DsLite)
+            ProvisioningDataError::Offer {
+                capability: Capability::DsLite,
+                ..
+            }
         ));
     }
 
@@ -1317,7 +1354,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            response.offer(Capability::IpIp),
+            response.raw_offer(Capability::IpIp),
             Some(&serde_json::json!([{
                 "ipv6_local": "2001:db8:1::1",
                 "ipv6_remote": "2001:db8:2::1",
@@ -1339,7 +1376,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProvisioningDataError::InvalidOfferShape(Capability::IpIp)
+            ProvisioningDataError::Offer {
+                capability: Capability::IpIp,
+                ..
+            }
         ));
     }
 
@@ -1356,7 +1396,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProvisioningDataError::InvalidOfferShape(Capability::IpIp)
+            ProvisioningDataError::Offer {
+                capability: Capability::IpIp,
+                ..
+            }
         ));
     }
 
@@ -1397,6 +1440,56 @@ mod tests {
 
         assert!(matches!(ttl_error, ProvisioningDataError::Ttl(_)));
         assert!(matches!(token_error, ProvisioningDataError::Token(_)));
+    }
+
+    #[test]
+    fn measures_informational_names_as_complete_json_strings() {
+        for accepted in ["a".repeat(254), "\"".repeat(127), "\\".repeat(127)] {
+            let input = serde_json::json!({"enabler_name": accepted, "order": []}).to_string();
+            assert!(ProvisioningData::parse(&input).is_ok());
+        }
+
+        for rejected in ["a".repeat(255), "\"".repeat(128), "\\".repeat(128)] {
+            let input = serde_json::json!({"enabler_name": rejected, "order": []}).to_string();
+            assert!(matches!(
+                ProvisioningData::parse(&input),
+                Err(ProvisioningDataError::InformationalNameTooLong(
+                    "enabler_name"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_null_for_every_known_shared_field() {
+        for field in [
+            "enabler_name",
+            "service_name",
+            "isp_name",
+            "ttl",
+            "token",
+            "auth",
+            "order",
+            "ipv6_mostly",
+        ] {
+            let mut response = serde_json::json!({"enabler_name": "example", "order": []});
+            response[field] = Value::Null;
+            let error = ProvisioningData::parse(&response.to_string()).unwrap_err();
+            assert!(
+                matches!(error, ProvisioningDataError::NullField(actual) if actual == field),
+                "unexpected error for {field}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_mostly_false_does_not_require_464xlat() {
+        let response =
+            ProvisioningData::parse(r#"{"enabler_name":"example","order":[],"ipv6_mostly":false}"#)
+                .unwrap();
+
+        assert_eq!(response.ipv6_mostly(), Some(false));
+        assert!(response.offer(Capability::Xlat464).is_none());
     }
 
     #[test]
