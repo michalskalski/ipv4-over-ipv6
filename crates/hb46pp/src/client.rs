@@ -968,15 +968,8 @@ mod tests {
     }
 
     fn valid_request() -> ProvisioningRequest {
-        ProvisioningRequest::new(
-            vendor_id(),
-            product(),
-            version(),
-            vec![Capability::DsLite],
-            None,
-            None,
-        )
-        .unwrap()
+        ProvisioningRequest::new(vendor_id(), product(), version(), vec![Capability::DsLite])
+            .unwrap()
     }
 
     fn expect_provisioned(outcome: ProvisioningOutcome) -> ProvisioningResponse {
@@ -1279,15 +1272,10 @@ mod tests {
             "example.com".to_string(),
         )
         .expect("credentials should be valid");
-        let request = ProvisioningRequest::new(
-            vendor_id(),
-            product(),
-            version(),
-            vec![Capability::DsLite],
-            None,
-            Some(credentials),
-        )
-        .expect("request should be valid");
+        let request =
+            ProvisioningRequest::new(vendor_id(), product(), version(), vec![Capability::DsLite])
+                .expect("request should be valid")
+                .with_credentials(credentials);
 
         let result = client.provision(&request).await;
 

@@ -31,15 +31,8 @@ pub fn provisioning_request(config: &DiscoveryConfig) -> Result<ProvisioningRequ
     let product = config.product.parse()?;
     let version = env!("CARGO_PKG_VERSION").replace('.', "_").parse()?;
 
-    ProvisioningRequest::new(
-        vendor_id,
-        product,
-        version,
-        vec![Capability::DsLite],
-        None,
-        None,
-    )
-    .map_err(RequestError::from)
+    ProvisioningRequest::new(vendor_id, product, version, vec![Capability::DsLite])
+        .map_err(RequestError::from)
 }
 
 /// Extracts the AFTR endpoint from the selected DS Lite offer, if present.

@@ -421,7 +421,10 @@ mod tests {
             unreachable!();
         };
         assert!(runtime.retained.is_none());
-        assert_eq!(runtime.request.token(), Some(TOKEN));
+        assert_eq!(
+            runtime.request.token().map(|token| token.as_str()),
+            Some(TOKEN)
+        );
     }
 
     #[cfg(not(feature = "hb46pp"))]

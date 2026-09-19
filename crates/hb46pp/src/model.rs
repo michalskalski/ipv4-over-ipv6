@@ -849,8 +849,6 @@ impl ProvisioningRequest {
         product: Product,
         version: FirmwareVersion,
         capabilities: Vec<Capability>,
-        token: Option<Token>,
-        credentials: Option<Credentials>,
     ) -> Result<Self, ProvisioningRequestError> {
         if capabilities.is_empty() {
             return Err(ProvisioningRequestError::EmptyCapabilities);
@@ -868,8 +866,8 @@ impl ProvisioningRequest {
             product,
             version,
             capabilities,
-            token,
-            credentials,
+            token: None,
+            credentials: None,
         })
     }
 
@@ -896,8 +894,8 @@ impl ProvisioningRequest {
     /// Returns the token to send with this request, if present.
     ///
     /// The returned value is sensitive and should not be logged.
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_ref().map(Token::as_str)
+    pub fn token(&self) -> Option<&Token> {
+        self.token.as_ref()
     }
 
     /// Sets the token sent with subsequent provisioning requests.
@@ -905,6 +903,12 @@ impl ProvisioningRequest {
     /// Passing `None` stops sending the current token.
     pub fn set_token(&mut self, token: Option<Token>) {
         self.token = token;
+    }
+
+    /// Sets credentials for this request.
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 
     /// Returns the credentials to send with this request, if present.
@@ -1037,7 +1041,7 @@ impl Bootstrap {
             query.append_pair("version", request.version().as_str());
             query.append_pair("capability", &capabilities);
             if let Some(token) = request.token() {
-                query.append_pair("token", token);
+                query.append_pair("token", token.as_str());
             }
             if let Some(credentials) = request.credentials() {
                 query.append_pair("user", credentials.user());
@@ -1127,15 +1131,8 @@ mod tests {
     }
 
     fn valid_request() -> ProvisioningRequest {
-        ProvisioningRequest::new(
-            vendor_id(),
-            product(),
-            version(),
-            vec![Capability::DsLite],
-            None,
-            None,
-        )
-        .unwrap()
+        ProvisioningRequest::new(vendor_id(), product(), version(), vec![Capability::DsLite])
+            .unwrap()
     }
 
     #[test]
@@ -1510,16 +1507,16 @@ mod tests {
             "V6MIG-ROUTER".parse().unwrap(),
             "1_32".parse().unwrap(),
             vec![Capability::MapE, Capability::DsLite, Capability::Lw4o6],
-            Some(TOKEN.parse().unwrap()),
-            None,
         )
         .unwrap();
+        let mut request = request;
+        request.set_token(Some(TOKEN.parse().unwrap()));
 
         assert_eq!(
             request.capabilities(),
             [Capability::MapE, Capability::DsLite, Capability::Lw4o6]
         );
-        assert_eq!(request.token(), Some(TOKEN));
+        assert_eq!(request.token().map(Token::as_str), Some(TOKEN));
     }
 
     #[test]
@@ -1599,8 +1596,7 @@ mod tests {
     #[test]
     fn rejects_empty_capabilities() {
         let error =
-            ProvisioningRequest::new(vendor_id(), product(), version(), Vec::new(), None, None)
-                .unwrap_err();
+            ProvisioningRequest::new(vendor_id(), product(), version(), Vec::new()).unwrap_err();
 
         assert_eq!(error, ProvisioningRequestError::EmptyCapabilities);
     }
@@ -1612,8 +1608,6 @@ mod tests {
             product(),
             version(),
             vec![Capability::DsLite, Capability::DsLite],
-            None,
-            None,
         )
         .unwrap_err();
 
@@ -1672,10 +1666,10 @@ mod tests {
             product(),
             version(),
             vec![Capability::MapE, Capability::DsLite],
-            Some(TOKEN.parse().unwrap()),
-            None,
         )
         .unwrap();
+        let mut request = request;
+        request.set_token(Some(TOKEN.parse().unwrap()));
 
         let pairs: Vec<_> = bootstrap
             .provisioning_url(&request)
@@ -1700,15 +1694,12 @@ mod tests {
     #[test]
     fn sends_credentials_without_expected_server_name() {
         let bootstrap = Bootstrap::parse(V6CONNECT_BOOTSTRAP).unwrap();
-        let request = ProvisioningRequest::new(
-            vendor_id(),
-            product(),
-            version(),
-            vec![Capability::DsLite],
-            None,
-            Some(Credentials::unrestricted("user".to_string(), "pass".to_string()).unwrap()),
-        )
-        .unwrap();
+        let request =
+            ProvisioningRequest::new(vendor_id(), product(), version(), vec![Capability::DsLite])
+                .unwrap()
+                .with_credentials(
+                    Credentials::unrestricted("user".to_string(), "pass".to_string()).unwrap(),
+                );
 
         let pairs: Vec<_> = bootstrap
             .provisioning_url(&request)
@@ -1724,30 +1715,20 @@ mod tests {
     #[test]
     fn sends_credentials_when_expected_server_name_matches_validated_https() {
         let bootstrap = Bootstrap::parse(V6CONNECT_BOOTSTRAP).unwrap();
-        let request = ProvisioningRequest::new(
-            vendor_id(),
-            product(),
-            version(),
-            vec![Capability::DsLite],
-            None,
-            Some(credentials_for_server("prod.v6mig.v6connect.net")),
-        )
-        .unwrap();
+        let request =
+            ProvisioningRequest::new(vendor_id(), product(), version(), vec![Capability::DsLite])
+                .unwrap()
+                .with_credentials(credentials_for_server("prod.v6mig.v6connect.net"));
 
         assert!(bootstrap.provisioning_url(&request).is_ok());
     }
 
     #[test]
     fn rejects_credentials_for_unvalidated_or_unexpected_bootstrap() {
-        let request_with_expected_server = ProvisioningRequest::new(
-            vendor_id(),
-            product(),
-            version(),
-            vec![Capability::DsLite],
-            None,
-            Some(credentials_for_server("provision.example")),
-        )
-        .unwrap();
+        let request_with_expected_server =
+            ProvisioningRequest::new(vendor_id(), product(), version(), vec![Capability::DsLite])
+                .unwrap()
+                .with_credentials(credentials_for_server("provision.example"));
         let http = Bootstrap::parse("v=v6mig-1 url=http://provision.example/rule.cgi t=a").unwrap();
         let unvalidated_https =
             Bootstrap::parse("v=v6mig-1 url=https://provision.example/rule.cgi t=a").unwrap();
@@ -1824,7 +1805,7 @@ mod tests {
         assert_eq!(request.token(), None);
 
         request.set_token(Some(TOKEN.parse().unwrap()));
-        assert_eq!(request.token(), Some(TOKEN));
+        assert_eq!(request.token().map(Token::as_str), Some(TOKEN));
 
         request.set_token(None);
         assert_eq!(request.token(), None);

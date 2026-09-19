@@ -18,7 +18,8 @@ use hb46pp::client::{
 #[cfg(feature = "default-client")]
 use hb46pp::client::{DefaultClient, DefaultClientBuilder, DefaultClientError};
 use hb46pp::{
-    Capability, MapEVersion, MapEVersionError, ProvisioningData, ProvisioningOffer, TunnelEndpoint,
+    Capability, Credentials, FirmwareVersion, MapEVersion, MapEVersionError, Product,
+    ProvisioningData, ProvisioningOffer, ProvisioningRequest, Token, TunnelEndpoint, VendorId,
 };
 
 struct FakeResolver;
@@ -122,6 +123,28 @@ fn downstream_crates_can_inspect_retry_actions() {
 
     let window = action.window();
     assert!(window.min() <= window.max());
+}
+
+#[test]
+fn downstream_crates_can_construct_and_update_requests() {
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let credentials =
+        Credentials::unrestricted("user".to_string(), "password".to_string()).unwrap();
+    let mut request = ProvisioningRequest::new(
+        "000000".parse::<VendorId>().unwrap(),
+        "example-router".parse::<Product>().unwrap(),
+        "1_0_0".parse::<FirmwareVersion>().unwrap(),
+        vec![Capability::DsLite],
+    )
+    .unwrap()
+    .with_credentials(credentials);
+
+    assert_eq!(request.credentials().unwrap().user(), "user");
+    assert!(request.token().is_none());
+
+    request.set_token(Some(TOKEN.parse::<Token>().unwrap()));
+    assert_eq!(request.token().map(Token::as_str), Some(TOKEN));
 }
 
 #[test]

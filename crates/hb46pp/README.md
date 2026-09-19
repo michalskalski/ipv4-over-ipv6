@@ -31,8 +31,6 @@ async fn provision() -> Result<(), Box<dyn std::error::Error>> {
         "example-router".parse::<Product>()?,
         "1_0_0".parse::<FirmwareVersion>()?,
         vec![Capability::DsLite],
-        None,
-        None,
     )?;
     let client = DefaultClient::try_new()?;
 
