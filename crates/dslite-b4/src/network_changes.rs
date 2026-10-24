@@ -129,7 +129,9 @@ impl NetworkChanges {
         set_nonblocking(fd.as_raw_fd())?;
 
         Ok(Self {
-            socket: AsyncFd::with_interest(fd, Interest::READABLE)?,
+            // SAFETY: `fd` is exclusively owned by the AsyncFd and is never
+            // replaced or closed while registered, so its descriptor stays valid.
+            socket: unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }?,
         })
     }
 
